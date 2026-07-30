@@ -1,0 +1,14 @@
+{
+  "schema": "energy-repro/recipe/v1",
+  "name": "sft-13b",
+  "pipeline": "sft",
+  "upstream_config": "configs/experiments/sft_32b_to_13b.yaml",
+  "teacher": "allenai/OLMo-2-0325-32B-SFT",
+  "student": "allenai/OLMo-2-1124-13B",
+  "dataset": "allenai/tulu-3-sft-mixture",
+  "asset_set": "sft-13b",
+  "preprocess_script": "tulu_preprocess_dataset",
+  "teacher_script": "synthetic_generation",
+  "estimated_min_ram_gib": 240
+}
+

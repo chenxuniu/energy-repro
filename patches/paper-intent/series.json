@@ -1,0 +1,59 @@
+{
+  "schema": "energy-repro/patch-series/v1",
+  "name": "paper-intent",
+  "status": "blocked-pending-validation",
+  "upstream_commit": "a3b76e861943bffa7be64aceb1d65993c9142249",
+  "patches": [
+    {
+      "id": "0001",
+      "name": "canonical-run-root-and-prerun",
+      "status": "planned"
+    },
+    {
+      "id": "0002",
+      "name": "canonical-energy-stages",
+      "status": "planned"
+    },
+    {
+      "id": "0003",
+      "name": "deterministic-data-ordering",
+      "status": "planned"
+    },
+    {
+      "id": "0004",
+      "name": "correct-synthetic-batching-and-token-budget",
+      "status": "planned"
+    },
+    {
+      "id": "0005",
+      "name": "unified-optimizer-step-semantics",
+      "status": "planned"
+    },
+    {
+      "id": "0006",
+      "name": "paper-early-stopping-and-best-checkpoint",
+      "status": "planned"
+    },
+    {
+      "id": "0007",
+      "name": "exact-checkpoint-resume",
+      "status": "planned"
+    },
+    {
+      "id": "0008",
+      "name": "strict-benchmark-targets-and-paths",
+      "status": "blocked-on-unreleased-eval-protocol"
+    },
+    {
+      "id": "0009",
+      "name": "baseline-sft-paper-grid",
+      "status": "blocked-on-missing-upstream-implementation"
+    }
+  ],
+  "known_scientific_conflicts": [
+    "Paper says effective batch size 4 with 16 accumulation steps; released code executes microbatch 4 x accumulation 16 = 64.",
+    "Paper early stopping (epsilon 0.002, patience 3, retain best) differs from both released trainers.",
+    "Released commit has no runnable baseline-SFT path for the paper's 3x3 core grid.",
+    "Exact five-benchmark evaluation and MT-Bench-101 judge protocol are not fully pinned in the release."
+  ]
+}

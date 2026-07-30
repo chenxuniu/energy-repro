@@ -1,0 +1,9 @@
+{
+  "schema": "energy-repro/upstream-lock/v1",
+  "repository": "https://github.com/StellarLuminosity/Energy.git",
+  "commit": "a3b76e861943bffa7be64aceb1d65993c9142249",
+  "archive_sha256": "531d6beeb1c28369e42df295f7d8ea7335540df02da30d17763fbb74b236e048",
+  "paper": "https://arxiv.org/abs/2605.13981",
+  "paper_version": "v1"
+}
+

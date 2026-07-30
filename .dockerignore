@@ -1,0 +1,8 @@
+.cache
+.state
+runs
+tests
+.venv
+dist
+__pycache__
+*.pyc

@@ -1,0 +1,32 @@
+{
+  "schema": "energy-repro/profile/v1",
+  "name": "h100-portable",
+  "description": "Portable single-H100 profile for hosts with at least 240 GiB RAM; GPU energy only.",
+  "source_mode": "upstream-exact",
+  "compliance_label": "gpu-comparable-cpu-and-total-energy-non-strict",
+  "runnable_stages": [
+    "smoke",
+    "preprocess",
+    "teacher",
+    "student"
+  ],
+  "blocked_stages": {
+    "eval": "The released evaluation dependency/protocol is incomplete and MT-Bench-101 is not commit-pinned.",
+    "all": "Use explicit stages so teacher artifacts and checkpoints can be synced between short leases."
+  },
+  "hardware": {
+    "gpu_count": 1,
+    "gpu_name_contains": "H100",
+    "min_vram_mib": 79000,
+    "power_limit_watts": null,
+    "cpu_name_contains": null,
+    "min_ram_gib": 240,
+    "require_rapl": false
+  },
+  "energy_overrides": {
+    "track_cpu": false,
+    "total_energy_policy": "gpu_only",
+    "rapl_root": "/sys/class/powercap"
+  },
+  "requires_known_deviations_ack": true
+}

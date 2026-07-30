@@ -1,0 +1,2109 @@
+#!/usr/bin/env python3
+"""Host-side launcher for the pinned StellarLuminosity/Energy capsule.
+
+This file intentionally uses only the Python standard library.  It must remain
+usable for planning and diagnostics on a fresh host before the OCI image exists.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Iterable
+from urllib.parse import unquote, urlparse
+
+
+BUNDLE = Path(__file__).resolve().parent
+SHA40 = re.compile(r"^[0-9a-f]{40}$")
+SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+SECRET_NAME = re.compile(r"(TOKEN|KEY|PASSWORD|SECRET|CREDENTIAL)", re.I)
+EXIT_ARGS = 2
+EXIT_PREREQ = 3
+EXIT_POLICY = 4
+EXIT_EXEC = 5
+EXIT_CONFLICT = 6
+
+
+class ReproError(RuntimeError):
+    def __init__(self, message: str, code: int = EXIT_EXEC, details: Any = None):
+        super().__init__(message)
+        self.code = code
+        self.details = details
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReproError(f"Cannot read valid JSON: {path}: {exc}", EXIT_ARGS) from exc
+    if not isinstance(value, dict):
+        raise ReproError(f"Expected a JSON object: {path}", EXIT_ARGS)
+    return value
+
+
+def canonical_bytes(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(canonical_bytes(value))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def redact(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: ("<redacted>" if SECRET_NAME.search(str(key)) else redact(item)) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    if isinstance(value, str):
+        value = re.sub(r"(?i)(hf_[A-Za-z0-9]{12,})", "<redacted>", value)
+        value = re.sub(r"(?i)(token|password|secret|credential)=([^,\s]+)", r"\1=<redacted>", value)
+    return value
+
+
+def emit(args: argparse.Namespace, value: Any) -> None:
+    safe = redact(value)
+    if getattr(args, "json", False):
+        print(json.dumps(safe, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    else:
+        print(json.dumps(safe, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def normalize_repo(url: str) -> str:
+    return url.strip().removesuffix("/").removesuffix(".git").lower()
+
+
+def run_capture(argv: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise ReproError(f"Required executable is not installed: {argv[0]}", EXIT_PREREQ) from exc
+    if check and result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise ReproError(f"Command failed ({result.returncode}): {argv!r}: {detail}", EXIT_EXEC)
+    return result
+
+
+def safe_path(path: str | Path, label: str, *, allow_missing: bool = True) -> Path:
+    raw = str(path)
+    if not raw.strip():
+        raise ReproError(f"{label} must not be empty", EXIT_ARGS)
+    candidate = Path(raw).expanduser().resolve(strict=not allow_missing)
+    if candidate == Path(candidate.anchor):
+        raise ReproError(f"{label} must not be a filesystem root: {candidate}", EXIT_POLICY)
+    return candidate
+
+
+def under(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def profile_path(name: str) -> Path:
+    if not SAFE_NAME.fullmatch(name):
+        raise ReproError(f"Invalid profile name: {name!r}", EXIT_ARGS)
+    path = BUNDLE / "profiles" / f"{name}.json"
+    if not path.is_file():
+        raise ReproError(f"Unknown profile: {name}", EXIT_ARGS)
+    return path
+
+
+def recipe_path(name: str) -> Path:
+    if not SAFE_NAME.fullmatch(name):
+        raise ReproError(f"Invalid recipe name: {name!r}", EXIT_ARGS)
+    path = BUNDLE / "recipes" / f"{name}.json"
+    if not path.is_file():
+        raise ReproError(f"Unknown recipe: {name}", EXIT_ARGS)
+    return path
+
+
+def resolved_dirs(args: argparse.Namespace) -> tuple[Path, Path, Path]:
+    cache = safe_path(args.cache_dir, "cache directory")
+    runs = safe_path(args.runs_dir, "runs directory")
+    state = safe_path(args.state_dir, "state directory")
+    return cache, runs, state
+
+
+def validate_bundle(profile: dict[str, Any] | None = None) -> dict[str, Any]:
+    upstream = read_json(BUNDLE / "upstream.lock.json")
+    image = read_json(BUNDLE / "image" / "image.lock.json")
+    assets = read_json(BUNDLE / "assets.lock.json")
+    series = read_json(BUNDLE / "patches" / "paper-intent" / "series.json")
+    errors: list[str] = []
+    warnings: list[str] = []
+    commit = upstream.get("commit", "")
+    archive_hash = upstream.get("archive_sha256", "")
+    if not SHA40.fullmatch(str(commit)):
+        errors.append("upstream commit is not a full 40-character SHA")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(archive_hash)):
+        errors.append("upstream archive hash is not SHA-256")
+    base = str(image.get("base_image", ""))
+    if not re.search(r"@sha256:[0-9a-f]{64}$", base):
+        errors.append("base OCI image is not digest-pinned")
+    for asset_id, asset in assets.get("assets", {}).items():
+        if not SAFE_NAME.fullmatch(asset_id):
+            errors.append(f"unsafe asset id: {asset_id!r}")
+        if not SHA40.fullmatch(str(asset.get("revision", ""))):
+            errors.append(f"asset {asset_id} is not pinned to a full commit revision")
+    known = set(assets.get("assets", {}))
+    for set_name, members in assets.get("sets", {}).items():
+        unknown = set(members) - known
+        if unknown:
+            errors.append(f"asset set {set_name} contains unknown assets: {sorted(unknown)}")
+    built = image.get("built_images", {})
+    if profile is not None and not built.get(profile["name"]):
+        warnings.append(f"no immutable built-image digest is recorded for profile {profile['name']}")
+    if profile is not None and profile.get("source_mode") == "paper-intent" and series.get("status") != "validated":
+        warnings.append(f"paper-intent patch series status is {series.get('status')!r}")
+    return {
+        "status": "FAIL" if errors else ("WARN" if warnings else "PASS"),
+        "errors": errors,
+        "warnings": warnings,
+        "upstream_commit": commit,
+        "base_image": base,
+        "assets": len(assets.get("assets", {})),
+    }
+
+
+def image_ref(args: argparse.Namespace, state: Path, *, planning: bool = False) -> tuple[str, bool]:
+    if getattr(args, "image", None):
+        return args.image, "@sha256:" in args.image
+    lock = read_json(BUNDLE / "image" / "image.lock.json")
+    locked = lock.get("built_images", {}).get(args.profile)
+    if locked:
+        return str(locked), True
+    bootstrap_state = state / "bootstrap-state.json"
+    if bootstrap_state.is_file():
+        recorded = read_json(bootstrap_state).get("image", {})
+        if recorded.get("ref"):
+            return str(recorded["ref"]), bool(recorded.get("immutable", False))
+    if planning:
+        sha = read_json(BUNDLE / "upstream.lock.json")["commit"][:8]
+        return f"energy-repro:{args.profile}-{sha}", False
+    raise ReproError(
+        "No built image is available. Run `./repro bootstrap --build-image` or pass --image registry/name@sha256:…",
+        EXIT_PREREQ,
+    )
+
+
+def verify_local_image(
+    args: argparse.Namespace,
+    state: Path,
+    ref: str,
+    *,
+    check_recorded: bool = True,
+    expected_build_context_sha256: str | None = None,
+) -> dict[str, Any]:
+    inspected = run_capture([args.runtime, "image", "inspect", ref], check=False)
+    if inspected.returncode:
+        raise ReproError(
+            f"OCI image is not present locally or cannot be inspected: {ref}",
+            EXIT_PREREQ,
+            (inspected.stderr or inspected.stdout).strip(),
+        )
+    try:
+        records = json.loads(inspected.stdout)
+        record = records[0]
+        image_id = str(record["Id"])
+        labels = record.get("Config", {}).get("Labels", {}) or {}
+        repo_digests = record.get("RepoDigests", []) or []
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
+        raise ReproError(f"Could not parse OCI image inspection for {ref}", EXIT_POLICY) from exc
+    upstream = read_json(BUNDLE / "upstream.lock.json")
+    dependency_lock_sha256 = sha256_file(BUNDLE / "locks" / "core-py310-cu124.txt")
+    errors: list[str] = []
+    if labels.get("org.opencontainers.image.revision") != upstream["commit"]:
+        errors.append("image source revision label does not match upstream.lock.json")
+    if labels.get("io.energy-repro.source-sha256") != upstream["archive_sha256"]:
+        errors.append("image source archive label does not match upstream.lock.json")
+    if labels.get("io.energy-repro.dependency-lock-sha256") != dependency_lock_sha256:
+        errors.append("image dependency lock label does not match the current bundle")
+    context_label = str(labels.get("io.energy-repro.build-context-sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", context_label):
+        errors.append("image has no valid build-context SHA-256 label")
+    if "@sha256:" in ref and ref not in repo_digests:
+        errors.append(f"requested immutable ref is absent from RepoDigests: {ref}")
+    bootstrap_state = state / "bootstrap-state.json"
+    if check_recorded:
+        if not bootstrap_state.is_file():
+            errors.append("bootstrap state is missing; run `./repro bootstrap` before using an image")
+        else:
+            recorded_state = read_json(bootstrap_state)
+            previous = recorded_state.get("image", {})
+            if previous.get("ref") == ref and previous.get("id") and previous["id"] != image_id:
+                errors.append("mutable image tag no longer points at the image recorded by bootstrap")
+            source_path = recorded_state.get("source", {}).get("path")
+            if not source_path or not Path(source_path).is_dir():
+                errors.append("bootstrap source cache is missing")
+            else:
+                current_context = build_context_manifest(Path(source_path))["context_sha256"]
+                if previous.get("build_context_sha256") != current_context:
+                    errors.append("bootstrap image context does not match the current bundle/source")
+                expected_build_context_sha256 = current_context
+            current_fingerprints = {
+                "dockerfile_sha256": sha256_file(BUNDLE / "image" / "Dockerfile"),
+                "dependency_lock_sha256": dependency_lock_sha256,
+                "assets_lock_sha256": sha256_file(BUNDLE / "assets.lock.json"),
+                "profile_sha256": sha256_file(profile_path(args.profile)),
+            }
+            if recorded_state.get("fingerprints") != current_fingerprints:
+                errors.append("bootstrap fingerprints do not match the current bundle")
+    if expected_build_context_sha256 and context_label != expected_build_context_sha256:
+        errors.append("image build-context label does not match the verified build context")
+    if errors:
+        raise ReproError("OCI image provenance verification failed", EXIT_POLICY, errors)
+    return {
+        "ref": ref,
+        "id": image_id,
+        "repo_digests": repo_digests,
+        "immutable": "@sha256:" in ref,
+        "labels": {
+            "org.opencontainers.image.revision": labels.get("org.opencontainers.image.revision"),
+            "io.energy-repro.source-sha256": labels.get("io.energy-repro.source-sha256"),
+            "io.energy-repro.build-context-sha256": labels.get("io.energy-repro.build-context-sha256"),
+            "io.energy-repro.dependency-lock-sha256": labels.get("io.energy-repro.dependency-lock-sha256"),
+        },
+    }
+
+
+def docker_mount(source: Path, target: str, readonly: bool = False) -> list[str]:
+    source = source.resolve()
+    if "," in str(source):
+        raise ReproError(f"Docker mount paths containing commas are unsupported: {source}", EXIT_POLICY)
+    spec = f"type=bind,src={source},dst={target}"
+    if readonly:
+        spec += ",readonly"
+    return ["--mount", spec]
+
+
+def container_identity_args() -> list[str]:
+    """Keep bind-mounted outputs owned by the invoking host user."""
+    if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
+        raise ReproError("This capsule currently requires a POSIX host user identity", EXIT_PREREQ)
+    return [
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        "--env",
+        "HOME=/tmp",
+        "--env",
+        "XDG_CACHE_HOME=/tmp/.cache",
+    ]
+
+
+def runtime_cache_args(cache: Path) -> list[str]:
+    return [
+        *docker_mount(cache / "runtime", "/cache/runtime", False),
+        "--env",
+        "HOME=/cache/runtime/home",
+        "--env",
+        "XDG_CACHE_HOME=/cache/runtime/xdg",
+        "--env",
+        "HF_HOME=/cache/runtime/huggingface",
+        "--env",
+        "HF_HUB_CACHE=/cache/runtime/huggingface/hub",
+        "--env",
+        "HF_DATASETS_CACHE=/cache/runtime/datasets",
+        "--env",
+        "HF_XET_CACHE=/cache/runtime/xet",
+        "--env",
+        "TORCH_HOME=/cache/runtime/torch",
+    ]
+
+
+def host_probe(profile: dict[str, Any], runtime: str) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    runtime_result = run_capture([runtime, "version"], check=False)
+    checks.append(
+        {
+            "name": "container_runtime",
+            "status": "PASS" if runtime_result.returncode == 0 else "FAIL",
+            "detail": (runtime_result.stderr or runtime_result.stdout).strip()[:400],
+        }
+    )
+    gpu_result = run_capture(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid,name,memory.total,power.limit",
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+    )
+    gpu_rows: list[dict[str, Any]] = []
+    if gpu_result.returncode == 0:
+        for line in gpu_result.stdout.splitlines():
+            parts = [item.strip() for item in line.split(",")]
+            if len(parts) >= 5:
+                try:
+                    gpu_rows.append(
+                        {
+                            "index": int(parts[0]),
+                            "uuid": parts[1],
+                            "name": parts[2],
+                            "memory_mib": float(parts[3]),
+                            "power_limit_watts": float(parts[4]),
+                        }
+                    )
+                except ValueError:
+                    pass
+    hardware = profile["hardware"]
+    gpu_errors: list[str] = []
+    if len(gpu_rows) != int(hardware["gpu_count"]):
+        gpu_errors.append(f"expected {hardware['gpu_count']} visible GPU, found {len(gpu_rows)}")
+    for gpu in gpu_rows:
+        if hardware["gpu_name_contains"] not in gpu["name"]:
+            gpu_errors.append(f"GPU name does not contain {hardware['gpu_name_contains']!r}: {gpu['name']}")
+        if gpu["memory_mib"] < float(hardware["min_vram_mib"]):
+            gpu_errors.append(f"GPU memory is {gpu['memory_mib']} MiB, below {hardware['min_vram_mib']}")
+        expected_power = hardware.get("power_limit_watts")
+        if expected_power is not None and abs(gpu["power_limit_watts"] - float(expected_power)) > 1.0:
+            gpu_errors.append(f"GPU power limit is {gpu['power_limit_watts']} W, expected {expected_power} W")
+    checks.append(
+        {
+            "name": "gpu",
+            "status": "FAIL" if gpu_errors or gpu_result.returncode else "PASS",
+            "detail": gpu_errors or (gpu_result.stderr.strip() if gpu_result.returncode else gpu_rows),
+        }
+    )
+    process_result = run_capture(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+    )
+    processes = [
+        line.strip()
+        for line in process_result.stdout.splitlines()
+        if line.strip() and "No running processes" not in line
+    ]
+    checks.append(
+        {
+            "name": "gpu_compute_processes",
+            "status": "FAIL" if process_result.returncode or processes else "PASS",
+            "detail": processes if processes else (process_result.stderr.strip() if process_result.returncode else []),
+        }
+    )
+    ram_gib = 0.0
+    try:
+        if Path("/proc/meminfo").is_file():
+            match = re.search(r"^MemTotal:\s+(\d+)\s+kB", Path("/proc/meminfo").read_text(), re.M)
+            if match:
+                ram_gib = int(match.group(1)) / 1024 / 1024
+        elif sys.platform == "darwin":
+            ram_gib = int(run_capture(["sysctl", "-n", "hw.memsize"]).stdout.strip()) / 1024**3
+    except (OSError, ValueError, ReproError):
+        pass
+    checks.append(
+        {
+            "name": "ram",
+            "status": "PASS" if ram_gib >= float(hardware["min_ram_gib"]) else "FAIL",
+            "detail": {"observed_gib": round(ram_gib, 2), "minimum_gib": hardware["min_ram_gib"]},
+        }
+    )
+    rapl = Path(profile["energy_overrides"]["rapl_root"])
+    if hardware.get("require_rapl"):
+        rapl_ok = rapl.is_dir() and os.access(rapl, os.R_OK)
+        checks.append({"name": "rapl", "status": "PASS" if rapl_ok else "FAIL", "detail": str(rapl)})
+    return {
+        "system": {
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "cpu": platform.processor(),
+            "ram_gib": round(ram_gib, 2),
+        },
+        "gpus": gpu_rows,
+        "checks": checks,
+        "status": "FAIL" if any(item["status"] == "FAIL" for item in checks) else "PASS",
+    }
+
+
+def assert_gpu_idle() -> None:
+    result = run_capture(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+    )
+    if result.returncode:
+        raise ReproError(
+            "Could not query existing GPU compute processes",
+            EXIT_PREREQ,
+            (result.stderr or result.stdout).strip(),
+        )
+    processes = [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip() and "No running processes" not in line
+    ]
+    if processes:
+        raise ReproError(
+            "GPU already has compute processes; energy measurements would be contaminated",
+            EXIT_POLICY,
+            processes,
+        )
+
+
+def command_doctor(args: argparse.Namespace) -> dict[str, Any]:
+    profile = read_json(profile_path(args.profile))
+    static = validate_bundle(profile)
+    result: dict[str, Any] = {
+        "command": "doctor",
+        "profile": args.profile,
+        "mode": args.mode,
+        "static": static,
+    }
+    if args.dry_run:
+        result.update(
+            {
+                "status": static["status"],
+                "dry_run": True,
+                "planned_probes": [
+                    f"{args.runtime} version",
+                    "nvidia-smi GPU identity, memory, power, ECC and process checks",
+                    "host CPU, RAM, RAPL and disk checks",
+                    "container CUDA/PyTorch/NVML probe" if args.mode == "runtime" else "container probe skipped",
+                ],
+                "deferred_checks": ["container runtime", "GPU", "driver", "host memory", "RAPL", "runtime imports"],
+            }
+        )
+        if static["errors"]:
+            raise ReproError("Static bundle validation failed", EXIT_POLICY, result)
+        return result
+    if static["errors"]:
+        raise ReproError("Static bundle validation failed", EXIT_POLICY, result)
+    if args.mode == "static":
+        result["status"] = static["status"]
+        return result
+    host = host_probe(profile, args.runtime)
+    result["host"] = host
+    if args.mode == "runtime" and host["status"] == "PASS":
+        _, _, state = resolved_dirs(args)
+        ref, immutable = image_ref(args, state)
+        image_verification = verify_local_image(args, state, ref)
+        probe = runtime_probe_argv(args, ref)
+        probe_result = run_capture(probe, check=False)
+        try:
+            detail: Any = json.loads(probe_result.stdout) if probe_result.stdout.strip() else probe_result.stderr.strip()
+        except json.JSONDecodeError:
+            detail = (probe_result.stdout + probe_result.stderr).strip()
+        result["runtime"] = {
+            "status": "PASS" if probe_result.returncode == 0 else "FAIL",
+            "image": ref,
+            "image_immutable": immutable,
+            "image_verification": image_verification,
+            "detail": detail,
+        }
+    result["status"] = (
+        "FAIL"
+        if host["status"] == "FAIL" or result.get("runtime", {}).get("status") == "FAIL"
+        else ("WARN" if static["warnings"] else "PASS")
+    )
+    if result["status"] == "FAIL":
+        raise ReproError("Host/runtime profile checks failed", EXIT_PREREQ, result)
+    return result
+
+
+def git_archive_sha(repo: Path) -> str:
+    try:
+        process = subprocess.Popen(
+            ["git", "archive", "--format=tar", "HEAD"],
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise ReproError("git is not installed", EXIT_PREREQ) from exc
+    assert process.stdout is not None
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: process.stdout.read(1024 * 1024), b""):
+        digest.update(chunk)
+    stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
+    returncode = process.wait()
+    if returncode:
+        raise ReproError(f"git archive failed: {stderr.strip()}", EXIT_EXEC)
+    return digest.hexdigest()
+
+
+def verify_source(repo: Path, lock: dict[str, Any]) -> dict[str, Any]:
+    if not (repo / ".git").is_dir():
+        raise ReproError(f"Source cache is not a git checkout: {repo}", EXIT_POLICY)
+    head = run_capture(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    dirty = run_capture(["git", "status", "--porcelain"], cwd=repo).stdout.strip()
+    remote = run_capture(["git", "remote", "get-url", "origin"], cwd=repo).stdout.strip()
+    archive = git_archive_sha(repo)
+    errors: list[str] = []
+    if head != lock["commit"]:
+        errors.append(f"HEAD is {head}, expected {lock['commit']}")
+    if dirty:
+        errors.append("source checkout is dirty")
+    if normalize_repo(remote) != normalize_repo(lock["repository"]):
+        errors.append(f"origin is {remote!r}, expected {lock['repository']!r}")
+    if archive != lock["archive_sha256"]:
+        errors.append(f"archive SHA-256 is {archive}, expected {lock['archive_sha256']}")
+    if errors:
+        raise ReproError("Pinned source verification failed", EXIT_POLICY, errors)
+    return {"path": str(repo), "commit": head, "archive_sha256": archive, "origin": remote, "dirty": False}
+
+
+def build_context_manifest(source: Path) -> dict[str, Any]:
+    roots = {
+        "image/Dockerfile": BUNDLE / "image" / "Dockerfile",
+        ".dockerignore": BUNDLE / ".dockerignore",
+        "locks/core-py310-cu124.txt": BUNDLE / "locks" / "core-py310-cu124.txt",
+    }
+    for path in sorted((BUNDLE / "tools").glob("*.py")):
+        roots[f"tools/{path.name}"] = path
+    for path in sorted(source.rglob("*")):
+        if ".git" in path.relative_to(source).parts:
+            continue
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ReproError(f"Upstream build source contains a symlink: {path}", EXIT_POLICY)
+        if stat.S_ISREG(info.st_mode):
+            roots[f"upstream/{path.relative_to(source).as_posix()}"] = path
+        elif not stat.S_ISDIR(info.st_mode):
+            raise ReproError(f"Upstream build source contains a special file: {path}", EXIT_POLICY)
+    files = {
+        relative: {
+            "sha256": sha256_file(path),
+            "executable": bool(path.stat().st_mode & stat.S_IXUSR),
+        }
+        for relative, path in sorted(roots.items())
+    }
+    value = {"schema": "energy-repro/build-context/v1", "files": files}
+    value["context_sha256"] = sha256_bytes(canonical_bytes(value))
+    return value
+
+
+def prepare_build_context(cache: Path, source: Path) -> tuple[Path, dict[str, Any]]:
+    manifest = build_context_manifest(source)
+    root = cache / "build-contexts"
+    destination = root / manifest["context_sha256"][:16]
+    marker_name = ".energy-build-context.json"
+    if destination.exists():
+        marker = read_json(destination / marker_name)
+        if marker != manifest:
+            raise ReproError(f"Cached build context marker differs from expected content: {destination}", EXIT_POLICY)
+        for relative, expected in manifest["files"].items():
+            path = destination / relative
+            if not path.is_file() or path.is_symlink() or sha256_file(path) != expected["sha256"]:
+                raise ReproError(f"Cached build context file is missing or modified: {path}", EXIT_POLICY)
+        return destination, manifest
+    root.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".context-", dir=root))
+    try:
+        for relative in manifest["files"]:
+            if relative.startswith("upstream/"):
+                source_path = source / relative.removeprefix("upstream/")
+            else:
+                source_path = BUNDLE / relative
+            target = temporary / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, target, follow_symlinks=False)
+        atomic_json(temporary / marker_name, manifest)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return destination, manifest
+
+
+def command_bootstrap(args: argparse.Namespace) -> dict[str, Any]:
+    if args.offline and args.build_image:
+        raise ReproError(
+            "Offline image builds are not supported: pip/base-image cache completeness cannot be proven. "
+            "Reuse an already verified image or build once while online.",
+            EXIT_POLICY,
+        )
+    profile = read_json(profile_path(args.profile))
+    static = validate_bundle(profile)
+    if static["errors"]:
+        raise ReproError("Static bundle validation failed", EXIT_POLICY, static)
+    cache, runs, state = resolved_dirs(args)
+    lock = read_json(BUNDLE / "upstream.lock.json")
+    source = cache / "source" / lock["commit"]
+    tag = f"energy-repro:{args.profile}-{lock['commit'][:8]}"
+    plan = {
+        "command": "bootstrap",
+        "profile": args.profile,
+        "offline": args.offline,
+        "source": str(source),
+        "source_commit": lock["commit"],
+        "source_archive_sha256": lock["archive_sha256"],
+        "build_image": args.build_image,
+        "image_tag": tag if args.build_image else None,
+        "requested_image": args.image,
+        "directories": [str(cache), str(runs), str(state)],
+    }
+    if args.dry_run:
+        plan["dry_run"] = True
+        plan["status"] = "PLANNED"
+        plan["deferred_checks"] = ["network/source cache", "container build", "GPU runtime"]
+        return plan
+    for directory in (cache, runs, state, source.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+    lock_path = state / "bootstrap.lock"
+    with lock_path.open("w") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ReproError("Another bootstrap process holds the lock", EXIT_CONFLICT) from exc
+        if not source.exists():
+            if args.offline:
+                raise ReproError(f"Offline bootstrap cannot find cached source: {source}", EXIT_PREREQ)
+            temporary = Path(tempfile.mkdtemp(prefix=".source-", dir=source.parent))
+            try:
+                run_capture(["git", "clone", "--no-checkout", lock["repository"], str(temporary)])
+                run_capture(["git", "checkout", "--detach", lock["commit"]], cwd=temporary)
+                verify_source(temporary, lock)
+                os.replace(temporary, source)
+            finally:
+                if temporary.exists():
+                    shutil.rmtree(temporary)
+        source_info = verify_source(source, lock)
+        context_manifest = build_context_manifest(source)
+        dependency_lock_sha256 = sha256_file(BUNDLE / "locks" / "core-py310-cu124.txt")
+        image_info: dict[str, Any] = {"ref": None, "immutable": False, "id": None}
+        previous_state_path = state / "bootstrap-state.json"
+        if previous_state_path.is_file() and not args.build_image:
+            previous_state = read_json(previous_state_path)
+            if previous_state.get("profile") == args.profile and previous_state.get("runtime") == args.runtime:
+                image_info = previous_state.get("image", image_info)
+        if args.build_image:
+            context, context_manifest = prepare_build_context(cache, source)
+            build = [
+                args.runtime,
+                "build",
+                "--platform",
+                "linux/amd64",
+                "--pull",
+                "--build-arg",
+                f"ENERGY_BUILD_CONTEXT_SHA256={context_manifest['context_sha256']}",
+                "--build-arg",
+                f"ENERGY_DEPENDENCY_LOCK_SHA256={dependency_lock_sha256}",
+                "--file",
+                str(context / "image" / "Dockerfile"),
+                "--tag",
+                tag,
+                str(context),
+            ]
+            run_capture(build)
+            image_info = verify_local_image(
+                args,
+                state,
+                tag,
+                check_recorded=False,
+                expected_build_context_sha256=context_manifest["context_sha256"],
+            )
+            image_info["build_context_sha256"] = context_manifest["context_sha256"]
+        elif not image_info.get("ref"):
+            locked = read_json(BUNDLE / "image" / "image.lock.json").get("built_images", {}).get(args.profile)
+            candidate = args.image or locked
+            if candidate:
+                if not args.offline and "@sha256:" in candidate:
+                    run_capture([args.runtime, "pull", candidate])
+                image_info = verify_local_image(
+                    args,
+                    state,
+                    candidate,
+                    check_recorded=False,
+                    expected_build_context_sha256=context_manifest["context_sha256"],
+                )
+                image_info["build_context_sha256"] = context_manifest["context_sha256"]
+            elif args.offline:
+                raise ReproError(
+                    "Offline bootstrap has no previously recorded or explicitly supplied local image",
+                    EXIT_PREREQ,
+                )
+        if not args.build_image and image_info.get("ref"):
+            image_info = verify_local_image(
+                args,
+                state,
+                str(image_info["ref"]),
+                check_recorded=False,
+                expected_build_context_sha256=context_manifest["context_sha256"],
+            )
+            image_info["build_context_sha256"] = context_manifest["context_sha256"]
+        state_value = {
+            "schema": "energy-repro/bootstrap-state/v1",
+            "created_at": utc_now(),
+            "profile": args.profile,
+            "runtime": args.runtime,
+            "source": source_info,
+            "image": image_info,
+            "fingerprints": {
+                "dockerfile_sha256": sha256_file(BUNDLE / "image" / "Dockerfile"),
+                "dependency_lock_sha256": sha256_file(BUNDLE / "locks" / "core-py310-cu124.txt"),
+                "assets_lock_sha256": sha256_file(BUNDLE / "assets.lock.json"),
+                "profile_sha256": sha256_file(profile_path(args.profile)),
+            },
+        }
+        atomic_json(state / "bootstrap-state.json", state_value)
+    return {"status": "PASS", **plan, "source_verification": source_info, "image": image_info}
+
+
+def common_container_env(run_id: str | None = None) -> list[str]:
+    values = {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "WANDB_MODE": "offline",
+        "TZ": "UTC",
+        "OMP_NUM_THREADS": "16",
+        "MKL_NUM_THREADS": "16",
+        "OPENBLAS_NUM_THREADS": "16",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    }
+    if run_id:
+        values["WANDB_DIR"] = f"/runs/{run_id}/wandb"
+    output: list[str] = []
+    for key, value in values.items():
+        output.extend(["-e", f"{key}={value}"])
+    return output
+
+
+def command_fetch_assets(args: argparse.Namespace) -> dict[str, Any]:
+    lock = read_json(BUNDLE / "assets.lock.json")
+    if args.asset_set not in lock.get("sets", {}):
+        raise ReproError(f"Unknown asset set: {args.asset_set}", EXIT_ARGS)
+    cache, _, state = resolved_dirs(args)
+    ref, immutable = image_ref(args, state, planning=args.dry_run)
+    asset_root = cache / "assets"
+    command = [
+        args.runtime,
+        "run",
+        "--rm",
+        "--network=none" if args.offline or args.verify_only else "--network=bridge",
+        *container_identity_args(),
+        *runtime_cache_args(cache),
+        *docker_mount(BUNDLE / "assets.lock.json", "/inputs/assets.lock.json", True),
+        *docker_mount(asset_root, "/cache/assets", False),
+    ]
+    if "HF_TOKEN" in os.environ and not args.dry_run:
+        command.extend(["-e", "HF_TOKEN"])
+    command.extend(
+        [
+            ref,
+            "python",
+            "/opt/energy-repro/tools/fetch_assets.py",
+            "--lock-file",
+            "/inputs/assets.lock.json",
+            "--cache-dir",
+            "/cache/assets",
+            "--set",
+            args.asset_set,
+            "--json",
+        ]
+    )
+    if args.offline:
+        command.append("--offline")
+    if args.verify_only:
+        command.append("--verify-only")
+    plan = {
+        "command": "fetch-assets",
+        "asset_set": args.asset_set,
+        "assets": lock["sets"][args.asset_set],
+        "expected_bytes": sum(
+            int(lock["assets"][asset_id].get("expected_bytes") or 0)
+            for asset_id in lock["sets"][args.asset_set]
+        ),
+        "cache": str(asset_root),
+        "image": ref,
+        "image_immutable": immutable,
+        "argv": command,
+    }
+    if args.dry_run:
+        return {"status": "PLANNED", "dry_run": True, **plan, "deferred_checks": ["image", "disk", "asset snapshots"]}
+    asset_root.mkdir(parents=True, exist_ok=True)
+    (cache / "runtime").mkdir(parents=True, exist_ok=True)
+    image_verification = verify_local_image(args, state, ref)
+    result = run_capture(command, check=False)
+    try:
+        detail: Any = json.loads(result.stdout) if result.stdout.strip() else result.stderr.strip()
+    except json.JSONDecodeError:
+        detail = (result.stdout + result.stderr).strip()
+    if result.returncode:
+        raise ReproError("Asset fetch/verification failed", EXIT_PREREQ, {"plan": plan, "detail": detail})
+    return {"status": "PASS", **plan, "image_verification": image_verification, "result": detail}
+
+
+def deterministic_plan(
+    profile: dict[str, Any],
+    recipe: dict[str, Any] | None,
+    stage: str,
+    seed: int,
+    attempt: int,
+    image: str,
+) -> tuple[dict[str, Any], str]:
+    upstream = read_json(BUNDLE / "upstream.lock.json")
+    scientific = {
+        "schema": "energy-repro/plan/v1",
+        "profile": profile["name"],
+        "compliance_label": profile["compliance_label"],
+        "recipe": recipe["name"] if recipe else "telemetry",
+        "pipeline": recipe["pipeline"] if recipe else "prerun",
+        "stage": stage,
+        "seed": seed,
+        "attempt": attempt,
+        "upstream_commit": upstream["commit"],
+        "upstream_archive_sha256": upstream["archive_sha256"],
+        "asset_lock_sha256": sha256_file(BUNDLE / "assets.lock.json"),
+        "dependency_lock_sha256": sha256_file(BUNDLE / "locks" / "core-py310-cu124.txt"),
+        "profile_sha256": sha256_file(profile_path(profile["name"])),
+        "recipe_sha256": sha256_file(recipe_path(recipe["name"])) if recipe else None,
+        "image": image,
+        "known_scientific_conflicts": read_json(BUNDLE / "patches" / "paper-intent" / "series.json")[
+            "known_scientific_conflicts"
+        ],
+    }
+    plan_hash = sha256_bytes(canonical_bytes(scientific))
+    name = recipe["name"] if recipe else "telemetry-smoke"
+    run_id = f"{name}__{profile['name']}__seed-{seed}__attempt-{attempt:03d}__{plan_hash[:8]}"
+    scientific["plan_sha256"] = plan_hash
+    scientific["run_id"] = run_id
+    return scientific, run_id
+
+
+def execution_provenance(image_verification: dict[str, Any]) -> dict[str, Any]:
+    upstream = read_json(BUNDLE / "upstream.lock.json")
+    labels = image_verification.get("labels", {})
+    return {
+        "schema": "energy-repro/execution-provenance/v1",
+        "upstream_commit": upstream["commit"],
+        "upstream_archive_sha256": upstream["archive_sha256"],
+        "dependency_lock_sha256": sha256_file(BUNDLE / "locks" / "core-py310-cu124.txt"),
+        "asset_lock_sha256": sha256_file(BUNDLE / "assets.lock.json"),
+        "build_context_sha256": labels.get("io.energy-repro.build-context-sha256"),
+        "resolver_tool_sha256": sha256_file(BUNDLE / "tools" / "resolve_config.py"),
+    }
+
+
+def artifact_inventory(run_root: Path, deep: bool = True) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    if not run_root.is_dir():
+        return output
+    for path in sorted(run_root.rglob("*")):
+        relative = path.relative_to(run_root).as_posix()
+        if relative in {"manifest.json", "state.json"} or relative.startswith("sync/receipts/"):
+            continue
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            output.append({"path": relative, "type": "symlink-rejected"})
+        elif stat.S_ISREG(info.st_mode):
+            item: dict[str, Any] = {"path": relative, "type": "file", "bytes": info.st_size}
+            if deep or info.st_size <= 16 * 1024 * 1024:
+                item["sha256"] = sha256_file(path)
+            else:
+                item["sha256"] = None
+            output.append(item)
+    return output
+
+
+def directory_stats(root: Path) -> dict[str, Any]:
+    if not root.is_dir():
+        raise ReproError(f"Expected derived artifact directory was not created: {root}", EXIT_EXEC)
+    payload_files: list[tuple[str, Path]] = []
+    total_bytes = 0
+    for path in sorted(root.rglob("*")):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ReproError(f"Derived artifact contains a symlink: {path}", EXIT_POLICY)
+        if stat.S_ISREG(info.st_mode):
+            payload_files.append((path.relative_to(root).as_posix(), path))
+        elif not stat.S_ISDIR(info.st_mode):
+            raise ReproError(f"Derived artifact contains a special file: {path}", EXIT_POLICY)
+    if not payload_files:
+        raise ReproError(f"Derived artifact directory is empty: {root}", EXIT_EXEC)
+    tree = hashlib.sha256()
+    for relative, path in sorted(payload_files):
+        content_sha256 = sha256_file(path)
+        size = path.stat().st_size
+        total_bytes += size
+        record = {"path": relative, "sha256": content_sha256, "size": size}
+        tree.update(json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+        tree.update(b"\n")
+    return {
+        "file_count": len(payload_files),
+        "total_bytes": total_bytes,
+        "tree_sha256": tree.hexdigest(),
+    }
+
+
+def container_cache_path_to_host(raw: str, cache: Path) -> Path:
+    container_root = Path("/cache")
+    candidate = Path(raw)
+    try:
+        relative = candidate.relative_to(container_root)
+    except ValueError as exc:
+        raise ReproError(f"Resolved derived path is outside /cache: {raw}", EXIT_POLICY) from exc
+    host = (cache / relative).resolve()
+    if not under(host, cache):
+        raise ReproError(f"Resolved derived path escapes host cache: {raw}", EXIT_POLICY)
+    return host
+
+
+def publish_derived_receipts(
+    metadata_path: Path,
+    cache: Path,
+    plan: dict[str, Any],
+) -> list[dict[str, Any]]:
+    metadata = read_json(metadata_path)
+    fingerprint = metadata.get("derived_fingerprint")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(fingerprint or "")):
+        raise ReproError("Resolved metadata has no valid derived fingerprint", EXIT_POLICY)
+    receipts: list[dict[str, Any]] = []
+    for artifact, spec in sorted(metadata.get("derived_artifacts", {}).items()):
+        if not spec.get("target_for_stage"):
+            continue
+        artifact_path = container_cache_path_to_host(str(spec["path"]), cache)
+        receipt_path = container_cache_path_to_host(str(spec["receipt_path"]), cache)
+        stats = directory_stats(artifact_path)
+        receipt = {
+            "schema": "energy-repro/derived-receipt/v1",
+            "artifact": artifact,
+            "fingerprint": fingerprint,
+            "status": "succeeded",
+            "tree_hash_algorithm": "sha256-jsonl-posix-path-size-content-sha256-v1",
+            "created_at": utc_now(),
+            "producer": {
+                "run_id": plan["run_id"],
+                "plan_sha256": plan["plan_sha256"],
+                "stage": plan["stage"],
+                "upstream_commit": plan["upstream_commit"],
+                "asset_lock_sha256": plan["asset_lock_sha256"],
+                "execution_provenance": metadata.get("execution_provenance"),
+            },
+            "payload": stats,
+        }
+        atomic_json(receipt_path, receipt)
+        receipts.append({"artifact": artifact, "path": str(receipt_path), **stats})
+    if plan["stage"] in {"preprocess", "teacher"} and not receipts:
+        raise ReproError(f"Stage {plan['stage']} produced no receipt-target artifacts", EXIT_EXEC)
+    return receipts
+
+
+def live_derived_status(
+    artifact: str,
+    spec: dict[str, Any],
+    fingerprint: str,
+    cache: Path,
+    expected_provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    artifact_path = container_cache_path_to_host(str(spec["path"]), cache)
+    receipt_path = container_cache_path_to_host(str(spec["receipt_path"]), cache)
+    artifact_exists = artifact_path.exists() or artifact_path.is_symlink()
+    receipt_exists = receipt_path.exists() or receipt_path.is_symlink()
+    base = {
+        "artifact": artifact,
+        "path": str(artifact_path),
+        "receipt_path": str(receipt_path),
+    }
+    if not artifact_exists and not receipt_exists:
+        return {**base, "status": "absent"}
+    if artifact_path.is_symlink() or receipt_path.is_symlink():
+        return {**base, "status": "invalid", "error": "artifact or receipt is a symlink"}
+    if not artifact_path.is_dir() or not receipt_path.is_file():
+        return {
+            **base,
+            "status": "invalid",
+            "error": "artifact and receipt must either both be absent or both be complete",
+        }
+    try:
+        receipt = read_json(receipt_path)
+        stats = directory_stats(artifact_path)
+    except ReproError as exc:
+        return {**base, "status": "invalid", "error": str(exc)}
+    expected_fields = {
+        "schema": "energy-repro/derived-receipt/v1",
+        "artifact": artifact,
+        "fingerprint": fingerprint,
+        "status": "succeeded",
+        "tree_hash_algorithm": "sha256-jsonl-posix-path-size-content-sha256-v1",
+    }
+    mismatches = [
+        key for key, expected in expected_fields.items() if receipt.get(key) != expected
+    ]
+    expected_payload = {
+        "file_count": stats["file_count"],
+        "total_bytes": stats["total_bytes"],
+        "tree_sha256": stats["tree_sha256"],
+    }
+    if receipt.get("payload") != expected_payload:
+        mismatches.append("payload")
+    if (
+        expected_provenance is not None
+        and receipt.get("producer", {}).get("execution_provenance")
+        != expected_provenance
+    ):
+        mismatches.append("producer.execution_provenance")
+    if mismatches:
+        return {
+            **base,
+            "status": "invalid",
+            "error": f"receipt mismatch in: {', '.join(mismatches)}",
+        }
+    return {**base, "status": "valid", "payload": expected_payload, "receipt": receipt}
+
+
+def acquire_derived_lock(metadata_path: Path, cache: Path) -> tuple[Any, str]:
+    metadata = read_json(metadata_path)
+    fingerprint = str(metadata.get("derived_fingerprint") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise ReproError("Resolved metadata has no valid derived fingerprint", EXIT_POLICY)
+    lock_path = cache / "derived" / ".locks" / f"{fingerprint}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock_file.close()
+        raise ReproError(
+            f"Another run is producing derived artifacts for fingerprint {fingerprint[:16]}",
+            EXIT_CONFLICT,
+        ) from exc
+    return lock_file, fingerprint
+
+
+def inspect_derived_production(
+    metadata_path: Path,
+    cache: Path,
+    recipe: dict[str, Any],
+    stage: str,
+    fingerprint: str,
+) -> dict[str, Any]:
+    metadata = read_json(metadata_path)
+    if metadata.get("derived_fingerprint") != fingerprint:
+        raise ReproError("Derived fingerprint changed while acquiring its lock", EXIT_POLICY)
+    targets = [
+        live_derived_status(
+            name,
+            spec,
+            fingerprint,
+            cache,
+            metadata.get("execution_provenance"),
+        )
+        for name, spec in sorted(metadata.get("derived_artifacts", {}).items())
+        if spec.get("target_for_stage")
+    ]
+    if not targets:
+        raise ReproError(f"Producer stage {stage!r} has no declared derived target", EXIT_POLICY)
+    if all(item["status"] == "valid" for item in targets):
+        return {"action": "reuse", "targets": targets}
+    invalid = [item for item in targets if item["status"] == "invalid"]
+    if invalid:
+        return {"action": "block", "targets": targets, "errors": invalid}
+    if recipe.get("pipeline") == "kd" and stage == "teacher":
+        workspace_spec = metadata.get("derived_artifacts", {}).get("logprob_cache", {})
+        workspace = container_cache_path_to_host(str(workspace_spec.get("path", "")), cache)
+        if workspace.exists() or workspace.is_symlink():
+            return {
+                "action": "block",
+                "targets": targets,
+                "errors": [
+                    {
+                        "artifact": "logprob_cache",
+                        "path": str(workspace),
+                        "status": "invalid",
+                        "error": "partial KD chunk workspace exists without a valid final receipt",
+                    }
+                ],
+            }
+    return {"action": "execute", "targets": targets}
+
+
+def initial_manifest(
+    plan: dict[str, Any],
+    profile: dict[str, Any],
+    state: str,
+    argv: list[str] | None = None,
+    hardware: Any = None,
+) -> dict[str, Any]:
+    return {
+        "schema": "energy-repro/manifest/v1",
+        "run_id": plan["run_id"],
+        "state": state,
+        "profile": profile["name"],
+        "compliance_label": profile["compliance_label"],
+        "plan": plan,
+        "execution": {
+            "argv": redact(argv or []),
+            "environment": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "WANDB_MODE": "offline",
+                "TZ": "UTC",
+            },
+        },
+        "hardware": hardware,
+        "artifacts": [],
+        "timestamps": {},
+        "exit_code": None,
+    }
+
+
+def write_run_state(run_root: Path, state: str, **extra: Any) -> None:
+    value = {"schema": "energy-repro/run-state/v1", "state": state, **extra}
+    atomic_json(run_root / "state.json", value)
+
+
+def execution_outcome(returncode: int) -> tuple[str, int]:
+    interrupt_codes = {
+        -int(signal.SIGINT),
+        -int(signal.SIGTERM),
+        128 + int(signal.SIGINT),
+        128 + int(signal.SIGTERM),
+    }
+    if returncode in interrupt_codes:
+        return "interrupted", 130 if returncode in {-int(signal.SIGINT), 128 + int(signal.SIGINT)} else 143
+    return ("succeeded", 0) if returncode == 0 else ("failed", EXIT_EXEC)
+
+
+def finalize_run_manifest(
+    run_root: Path,
+    manifest: dict[str, Any],
+    state: str,
+    exit_code: int,
+    **state_details: Any,
+) -> None:
+    manifest["state"] = state
+    manifest["exit_code"] = exit_code
+    manifest["timestamps"]["finished_at"] = utc_now()
+    manifest["artifacts"] = artifact_inventory(run_root)
+    atomic_json(run_root / "manifest.json", manifest)
+    write_run_state(
+        run_root,
+        state,
+        exit_code=exit_code,
+        finished_at=manifest["timestamps"]["finished_at"],
+        **state_details,
+    )
+
+
+def execute_logged(argv: list[str], log_path: Path) -> int:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8", buffering=1) as log:
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        old_handlers: dict[int, Any] = {}
+
+        def forward(signum: int, _frame: Any) -> None:
+            if process.poll() is None:
+                process.send_signal(signum)
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            old_handlers[signum] = signal.signal(signum, forward)
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                log.write(line)
+                print(line, end="")
+            return process.wait()
+        finally:
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+
+
+def base_gpu_container(args: argparse.Namespace, ref: str) -> list[str]:
+    return [
+        args.runtime,
+        "run",
+        "--rm",
+        "--network=none",
+        *container_identity_args(),
+        "--gpus",
+        "device=0",
+        "--ipc=host",
+        "--ulimit",
+        "memlock=-1",
+    ]
+
+
+def runtime_probe_argv(args: argparse.Namespace, ref: str) -> list[str]:
+    command = [
+        *base_gpu_container(args, ref),
+        *docker_mount(profile_path(args.profile), "/inputs/profile.json", True),
+    ]
+    rapl_root = Path("/sys/class/powercap")
+    if rapl_root.is_dir():
+        command.extend(docker_mount(rapl_root, "/sys/class/powercap", True))
+    command.extend(
+        [
+        ref,
+        "python",
+        "/opt/energy-repro/tools/runtime_probe.py",
+        "--profile-file",
+        "/inputs/profile.json",
+        "--json",
+        ]
+    )
+    return command
+
+
+def existing_run_result(run_root: Path, plan: dict[str, Any]) -> dict[str, Any] | None:
+    if not run_root.exists():
+        return None
+    existing_plan_path = run_root / "plan.json"
+    if not existing_plan_path.is_file():
+        raise ReproError(f"Run directory exists without a plan and will not be overwritten: {run_root}", EXIT_CONFLICT)
+    existing = read_json(existing_plan_path)
+    if existing.get("plan_sha256") != plan["plan_sha256"]:
+        raise ReproError(f"Run ID collision with a different plan: {run_root}", EXIT_CONFLICT)
+    state_path = run_root / "state.json"
+    state = read_json(state_path).get("state") if state_path.is_file() else "planned"
+    if state == "succeeded":
+        return {"status": "NOOP", "run_id": plan["run_id"], "reason": "run already succeeded"}
+    if state == "running":
+        raise ReproError(f"Run is already active: {plan['run_id']}", EXIT_CONFLICT)
+    if state in {"failed", "interrupted"}:
+        raise ReproError(
+            f"Run attempt is {state} and will not be overwritten; increment --attempt. "
+            "Automatic resume is intentionally unsupported because the pinned trainer cannot resume exactly.",
+            EXIT_CONFLICT,
+        )
+    return None
+
+
+def command_smoke(args: argparse.Namespace) -> dict[str, Any]:
+    profile = read_json(profile_path(args.profile))
+    if "smoke" not in profile.get("runnable_stages", []):
+        raise ReproError(f"Profile {args.profile} does not allow smoke", EXIT_POLICY)
+    if args.kind == "pipeline" and not args.recipe:
+        raise ReproError("--kind pipeline requires --recipe", EXIT_ARGS)
+    recipe = read_json(recipe_path(args.recipe)) if args.recipe else None
+    cache, runs, state_dir = resolved_dirs(args)
+    ref, immutable = image_ref(args, state_dir, planning=args.dry_run)
+    plan, run_id = deterministic_plan(profile, recipe if args.kind == "pipeline" else None, "smoke", 42, args.attempt, ref)
+    run_root = runs / run_id
+    if args.kind == "pipeline":
+        planned_command = ["./repro", "run", "--recipe", args.recipe, "--stage", "student", "--dry-run"]
+    else:
+        planned_command = [
+            *base_gpu_container(args, ref),
+            *common_container_env(run_id),
+            *docker_mount(runs, "/runs", False),
+            ref,
+            "python",
+            "/opt/energy-repro/tools/telemetry_smoke.py",
+            "--output",
+            f"/runs/{run_id}/outputs/telemetry-smoke.json",
+            "--duration-seconds",
+            "10",
+            "--sample-interval",
+            "0.5",
+        ]
+    result = {
+        "command": "smoke",
+        "kind": args.kind,
+        "profile": args.profile,
+        "run_id": run_id,
+        "run_root": str(run_root),
+        "image": ref,
+        "image_immutable": immutable,
+        "plan": plan,
+        "argv": planned_command,
+    }
+    if args.dry_run:
+        return {"status": "PLANNED", "dry_run": True, **result, "deferred_checks": ["image", "GPU", "NVML"]}
+    if args.kind == "pipeline":
+        raise ReproError(
+            "Pipeline smoke is intentionally not automated yet; it needs a separately audited tiny-step config. "
+            "Use telemetry smoke, then an explicit formal stage.",
+            EXIT_POLICY,
+        )
+    existing = existing_run_result(run_root, plan)
+    if existing:
+        return existing
+    assert_gpu_idle()
+    image_verification = verify_local_image(args, state_dir, ref)
+    run_root.mkdir(parents=True)
+    (run_root / "outputs").mkdir(parents=True)
+    atomic_json(run_root / "plan.json", plan)
+    manifest = initial_manifest(plan, profile, "planned", planned_command)
+    manifest["image_verification"] = image_verification
+    manifest["timestamps"]["created_at"] = utc_now()
+    atomic_json(run_root / "manifest.json", manifest)
+    write_run_state(run_root, "planned")
+    probe = run_capture(runtime_probe_argv(args, ref), check=False)
+    if probe.returncode:
+        manifest["failure"] = {
+            "phase": "runtime-probe",
+            "subprocess_exit_code": probe.returncode,
+            "detail": redact((probe.stdout + probe.stderr).strip()[:16000]),
+        }
+        finalize_run_manifest(run_root, manifest, "failed", EXIT_PREREQ, phase="runtime-probe")
+        raise ReproError("Runtime GPU probe failed before smoke", EXIT_PREREQ, probe.stdout + probe.stderr)
+    try:
+        hardware = json.loads(probe.stdout)
+    except json.JSONDecodeError:
+        hardware = {"raw": probe.stdout.strip()}
+    manifest["state"] = "running"
+    manifest["hardware"] = hardware
+    manifest["timestamps"]["started_at"] = utc_now()
+    atomic_json(run_root / "manifest.json", manifest)
+    write_run_state(run_root, "running", started_at=manifest["timestamps"]["started_at"])
+    try:
+        returncode = execute_logged(planned_command, run_root / "logs" / "telemetry-smoke.log")
+    except KeyboardInterrupt:
+        manifest["failure"] = {"phase": "execution", "detail": "interrupted by user"}
+        finalize_run_manifest(run_root, manifest, "interrupted", 130, phase="execution")
+        raise
+    except OSError as exc:
+        manifest["failure"] = {"phase": "execution", "detail": redact(str(exc))}
+        finalize_run_manifest(run_root, manifest, "failed", EXIT_EXEC, phase="execution")
+        raise ReproError("Could not launch telemetry smoke", EXIT_EXEC, str(exc)) from exc
+    final_state, wrapper_exit_code = execution_outcome(returncode)
+    finalize_run_manifest(run_root, manifest, final_state, returncode)
+    if returncode:
+        message = "Telemetry smoke was interrupted" if final_state == "interrupted" else "Telemetry smoke failed"
+        raise ReproError(message, wrapper_exit_code, {"run_id": run_id, "exit_code": returncode})
+    return {"status": "PASS", **result, "manifest": str(run_root / "manifest.json")}
+
+
+def stage_module(recipe: dict[str, Any], stage: str) -> list[str]:
+    if stage == "preprocess":
+        module = f"distill_bench.data.{recipe['preprocess_script']}"
+        return ["python", "-m", module]
+    if stage == "teacher":
+        module = f"distill_bench.data.{recipe['teacher_script']}"
+        return ["python", "-m", module]
+    if stage == "student":
+        return ["python", "/opt/energy/run_experiment.py"]
+    raise ReproError(f"No execution mapping for stage: {stage}", EXIT_POLICY)
+
+
+def resolver_argv(
+    args: argparse.Namespace,
+    ref: str,
+    cache: Path,
+    runs: Path,
+    run_id: str,
+    recipe: dict[str, Any],
+) -> list[str]:
+    return [
+        args.runtime,
+        "run",
+        "--rm",
+        "--network=none",
+        *container_identity_args(),
+        *runtime_cache_args(cache),
+        *docker_mount(BUNDLE / "assets.lock.json", "/inputs/assets.lock.json", True),
+        *docker_mount(profile_path(args.profile), "/inputs/profile.json", True),
+        *docker_mount(recipe_path(recipe["name"]), "/inputs/recipe.json", True),
+        *docker_mount(cache / "assets", "/cache/assets", True),
+        *docker_mount(cache / "derived", "/cache/derived", False),
+        *docker_mount(runs, "/runs", False),
+        ref,
+        "python",
+        "/opt/energy-repro/tools/resolve_config.py",
+        "--base",
+        "/opt/energy/configs/base.yaml",
+        "--experiment",
+        f"/opt/energy/{recipe['upstream_config']}",
+        "--profile",
+        "/inputs/profile.json",
+        "--recipe",
+        "/inputs/recipe.json",
+        "--provenance",
+        f"/runs/{run_id}/resolved/execution-provenance.json",
+        "--stage",
+        args.stage,
+        "--seed",
+        str(args.seed),
+        "--run-root",
+        f"/runs/{run_id}",
+        "--assets-lock",
+        "/inputs/assets.lock.json",
+        "--asset-cache",
+        "/cache",
+        "--output",
+        f"/runs/{run_id}/resolved/{args.stage}.yaml",
+        "--metadata-output",
+        f"/runs/{run_id}/resolved/{args.stage}.metadata.json",
+        "--formal",
+    ]
+
+
+def stage_argv(
+    args: argparse.Namespace,
+    ref: str,
+    cache: Path,
+    runs: Path,
+    run_id: str,
+    recipe: dict[str, Any],
+) -> list[str]:
+    config = f"/runs/{run_id}/resolved/{args.stage}.yaml"
+    return [
+        *base_gpu_container(args, ref),
+        *common_container_env(run_id),
+        *runtime_cache_args(cache),
+        *docker_mount(cache / "assets", "/cache/assets", True),
+        *docker_mount(cache / "derived", "/cache/derived", False),
+        *docker_mount(runs, "/runs", False),
+        ref,
+        *stage_module(recipe, args.stage),
+        "--config",
+        config,
+    ]
+
+
+def command_run(args: argparse.Namespace) -> dict[str, Any]:
+    profile = read_json(profile_path(args.profile))
+    blocked = profile.get("blocked_stages", {})
+    if args.stage in blocked:
+        raise ReproError(f"{args.profile} blocks stage {args.stage!r}: {blocked[args.stage]}", EXIT_POLICY)
+    if args.stage not in profile.get("runnable_stages", []):
+        raise ReproError(f"{args.profile} does not allow stage {args.stage!r}", EXIT_POLICY)
+    recipe = read_json(recipe_path(args.recipe))
+    cache, runs, state_dir = resolved_dirs(args)
+    ref, immutable = image_ref(args, state_dir, planning=args.dry_run)
+    plan, run_id = deterministic_plan(profile, recipe, args.stage, args.seed, args.attempt, ref)
+    run_root = runs / run_id
+    resolve_command = resolver_argv(args, ref, cache, runs, run_id, recipe)
+    execute_command = stage_argv(args, ref, cache, runs, run_id, recipe)
+    result = {
+        "command": "run",
+        "profile": args.profile,
+        "recipe": args.recipe,
+        "stage": args.stage,
+        "run_id": run_id,
+        "run_root": str(run_root),
+        "image": ref,
+        "image_immutable": immutable,
+        "plan": plan,
+        "resolver_argv": resolve_command,
+        "execution_argv": execute_command,
+        "known_deviations_acknowledged": bool(args.ack_known_deviations),
+    }
+    if args.dry_run:
+        deferred = ["image", "GPU", "assets", "derived stage inputs"]
+        if profile.get("requires_known_deviations_ack") and not args.ack_known_deviations:
+            deferred.append("explicit --ack-known-deviations required for execution")
+        return {"status": "PLANNED", "dry_run": True, **result, "deferred_checks": deferred}
+    if profile.get("requires_known_deviations_ack") and not args.ack_known_deviations:
+        raise ReproError(
+            f"{args.profile} is {profile['compliance_label']}; pass --ack-known-deviations after reading README.md",
+            EXIT_POLICY,
+        )
+    existing = existing_run_result(run_root, plan)
+    if existing:
+        return existing
+    assert_gpu_idle()
+    image_verification = verify_local_image(args, state_dir, ref)
+    for directory in (cache / "assets", cache / "derived", cache / "runtime", runs):
+        directory.mkdir(parents=True, exist_ok=True)
+    run_root.mkdir(parents=True)
+    for child in ("resolved", "logs", "energy", "outputs", "wandb"):
+        (run_root / child).mkdir()
+    provenance = execution_provenance(image_verification)
+    atomic_json(run_root / "resolved" / "execution-provenance.json", provenance)
+    atomic_json(run_root / "plan.json", plan)
+    manifest = initial_manifest(plan, profile, "planned", execute_command)
+    manifest["image_verification"] = image_verification
+    manifest["execution_provenance"] = provenance
+    manifest["timestamps"]["created_at"] = utc_now()
+    atomic_json(run_root / "manifest.json", manifest)
+    write_run_state(run_root, "planned")
+    lock_path = run_root / ".stage.lock"
+    with lock_path.open("w") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ReproError(f"Run is locked: {run_id}", EXIT_CONFLICT) from exc
+        probe = run_capture(runtime_probe_argv(args, ref), check=False)
+        if probe.returncode:
+            manifest["failure"] = {
+                "phase": "runtime-probe",
+                "subprocess_exit_code": probe.returncode,
+                "detail": redact((probe.stdout + probe.stderr).strip()[:16000]),
+            }
+            finalize_run_manifest(run_root, manifest, "failed", EXIT_PREREQ, phase="runtime-probe")
+            raise ReproError("Runtime GPU probe failed before formal stage", EXIT_PREREQ, probe.stdout + probe.stderr)
+        try:
+            hardware = json.loads(probe.stdout)
+        except json.JSONDecodeError:
+            hardware = {"raw": probe.stdout.strip()}
+        resolve = run_capture(resolve_command, check=False)
+        if resolve.returncode:
+            manifest["hardware"] = hardware
+            manifest["failure"] = {
+                "phase": "resolve-config",
+                "subprocess_exit_code": resolve.returncode,
+                "detail": redact((resolve.stdout + resolve.stderr).strip()[:16000]),
+            }
+            finalize_run_manifest(run_root, manifest, "failed", EXIT_PREREQ, phase="resolve-config")
+            raise ReproError(
+                "Config resolution or asset verification failed",
+                EXIT_PREREQ,
+                (resolve.stdout + resolve.stderr).strip(),
+            )
+        metadata_path = run_root / "resolved" / f"{args.stage}.metadata.json"
+        derived_lock_file: Any = None
+        production: dict[str, Any] | None = None
+        if args.stage in {"preprocess", "teacher"}:
+            try:
+                derived_lock_file, fingerprint = acquire_derived_lock(metadata_path, cache)
+            except ReproError as exc:
+                manifest["hardware"] = hardware
+                manifest["failure"] = {"phase": "derived-lock", "detail": str(exc)}
+                finalize_run_manifest(run_root, manifest, "failed", exc.code, phase="derived-lock")
+                raise
+            try:
+                production = inspect_derived_production(
+                    metadata_path,
+                    cache,
+                    recipe,
+                    args.stage,
+                    fingerprint,
+                )
+            except ReproError as exc:
+                derived_lock_file.close()
+                manifest["hardware"] = hardware
+                manifest["failure"] = {"phase": "derived-preflight", "detail": str(exc)}
+                finalize_run_manifest(run_root, manifest, "failed", exc.code, phase="derived-preflight")
+                raise
+            if production["action"] == "block":
+                derived_lock_file.close()
+                manifest["hardware"] = hardware
+                manifest["failure"] = {
+                    "phase": "derived-preflight",
+                    "detail": (
+                        "A partial, invalid, or mismatched derived artifact already exists. "
+                        "It was not overwritten; move it to quarantine or change the recipe namespace."
+                    ),
+                    "errors": production["errors"],
+                }
+                finalize_run_manifest(run_root, manifest, "failed", EXIT_POLICY, phase="derived-preflight")
+                raise ReproError(
+                    "Refusing to overwrite an incomplete or invalid derived artifact",
+                    EXIT_POLICY,
+                    production["errors"],
+                )
+
+        manifest["state"] = "running"
+        manifest["hardware"] = hardware
+        manifest["timestamps"]["started_at"] = utc_now()
+        manifest["config_resolution"] = str(metadata_path)
+        manifest["execution_mode"] = "derived-cache-hit" if production and production["action"] == "reuse" else "executed"
+        atomic_json(run_root / "manifest.json", manifest)
+        write_run_state(run_root, "running", started_at=manifest["timestamps"]["started_at"])
+        if production and production["action"] == "reuse":
+            manifest["derived_reuse"] = production["targets"]
+            finalize_run_manifest(run_root, manifest, "succeeded", 0, execution_mode="derived-cache-hit")
+            derived_lock_file.close()
+            return {
+                "status": "NOOP",
+                **result,
+                "reason": "validated derived cache hit; upstream producer was not launched",
+                "manifest": str(run_root / "manifest.json"),
+            }
+        derived_receipts: list[dict[str, Any]] = []
+        try:
+            returncode = execute_logged(execute_command, run_root / "logs" / f"{args.stage}.log")
+            if returncode == 0 and args.stage in {"preprocess", "teacher"}:
+                try:
+                    derived_receipts = publish_derived_receipts(
+                        run_root / "resolved" / f"{args.stage}.metadata.json",
+                        cache,
+                        plan,
+                    )
+                except Exception as exc:
+                    returncode = exc.code if isinstance(exc, ReproError) else EXIT_EXEC
+                    manifest["receipt_error"] = redact(str(exc))
+        except KeyboardInterrupt:
+            manifest["failure"] = {"phase": "execution", "detail": "interrupted by user"}
+            finalize_run_manifest(run_root, manifest, "interrupted", 130, phase="execution")
+            raise
+        except OSError as exc:
+            manifest["failure"] = {"phase": "execution", "detail": redact(str(exc))}
+            finalize_run_manifest(run_root, manifest, "failed", EXIT_EXEC, phase="execution")
+            raise ReproError("Could not launch or record experiment stage", EXIT_EXEC, str(exc)) from exc
+        finally:
+            if derived_lock_file is not None:
+                derived_lock_file.close()
+        final_state, wrapper_exit_code = execution_outcome(returncode)
+        manifest["derived_receipts"] = derived_receipts
+        finalize_run_manifest(run_root, manifest, final_state, returncode)
+    if returncode:
+        message = "Experiment stage was interrupted" if final_state == "interrupted" else "Experiment stage failed"
+        raise ReproError(message, wrapper_exit_code, {"run_id": run_id, "exit_code": returncode})
+    return {"status": "PASS", **result, "manifest": str(run_root / "manifest.json")}
+
+
+def parse_sync_target(raw: str) -> Path:
+    parsed = urlparse(raw)
+    if parsed.scheme in ("", "file"):
+        if parsed.scheme == "file" and parsed.netloc not in ("", "localhost"):
+            raise ReproError("file:// sync targets must be local", EXIT_ARGS)
+        value = unquote(parsed.path) if parsed.scheme == "file" else raw
+        return safe_path(value, "sync target")
+    raise ReproError(
+        f"Unsupported sync scheme {parsed.scheme!r}; use a mounted persistent path or file:///…",
+        EXIT_ARGS,
+    )
+
+
+def iter_regular_files(root: Path) -> Iterable[tuple[Path, Path]]:
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if relative.parts[:2] == ("sync", "receipts"):
+            continue
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ReproError(f"Refusing to sync symlink: {relative}", EXIT_POLICY)
+        if stat.S_ISREG(info.st_mode):
+            yield path, relative
+        elif not stat.S_ISDIR(info.st_mode):
+            raise ReproError(f"Refusing to sync special file: {relative}", EXIT_POLICY)
+
+
+def command_sync(args: argparse.Namespace) -> dict[str, Any]:
+    if not SAFE_NAME.fullmatch(args.run_id):
+        raise ReproError(f"Invalid run ID: {args.run_id!r}", EXIT_ARGS)
+    _, runs, _ = resolved_dirs(args)
+    source = runs / args.run_id
+    if not source.is_dir():
+        raise ReproError(f"Run does not exist: {source}", EXIT_PREREQ)
+    target_root = parse_sync_target(args.to)
+    target = target_root / args.run_id
+    if under(target, source) or target.resolve() == source.resolve():
+        raise ReproError("Sync target must not be inside the source run", EXIT_POLICY)
+    state_path = source / "state.json"
+    manifest_path = source / "manifest.json"
+    source_state = (
+        read_json(state_path).get("state")
+        if state_path.is_file()
+        else (read_json(manifest_path).get("state") if manifest_path.is_file() else "unknown")
+    )
+    stage_lock_path = source / ".stage.lock"
+    stage_lock_file: Any = None
+    active = source_state in {"planned", "running"}
+    if stage_lock_path.is_file():
+        stage_lock_file = stage_lock_path.open("r")
+        try:
+            fcntl.flock(stage_lock_file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            active = True
+            stage_lock_file.close()
+            stage_lock_file = None
+    files = list(iter_regular_files(source))
+    plan = {
+        "command": "sync",
+        "run_id": args.run_id,
+        "source": str(source),
+        "target": str(target),
+        "files": len(files),
+        "bytes": sum(path.stat().st_size for path, _ in files),
+        "verify": True,
+        "requested_verify_flag": bool(args.verify),
+        "source_state": source_state,
+        "snapshot_kind": "partial" if active else "complete",
+        "delete": False,
+        "follow_symlinks": False,
+    }
+    if args.dry_run:
+        if stage_lock_file is not None:
+            stage_lock_file.close()
+        return {"status": "PLANNED", "dry_run": True, **plan}
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        snapshot_files: list[dict[str, Any]] = []
+        for source_file, relative in files:
+            before = source_file.stat()
+            source_hash = sha256_file(source_file)
+            after_hash = source_file.stat()
+            if (
+                before.st_size != after_hash.st_size
+                or before.st_mtime_ns != after_hash.st_mtime_ns
+            ):
+                raise ReproError(
+                    f"Source changed while hashing {relative}; rerun sync for a stable snapshot",
+                    EXIT_CONFLICT,
+                )
+            destination = target / relative
+            if destination.is_symlink():
+                raise ReproError(f"Refusing to overwrite destination symlink: {destination}", EXIT_POLICY)
+            if destination.exists() and not destination.is_file():
+                raise ReproError(f"Refusing to overwrite non-file destination: {destination}", EXIT_POLICY)
+            if destination.is_file() and sha256_file(destination) == source_hash:
+                snapshot_files.append(
+                    {"path": relative.as_posix(), "bytes": before.st_size, "sha256": source_hash}
+                )
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+            os.close(descriptor)
+            try:
+                shutil.copy2(source_file, temporary, follow_symlinks=False)
+                if sha256_file(Path(temporary)) != source_hash:
+                    raise ReproError(f"Checksum failed while syncing {relative}", EXIT_EXEC)
+                after_copy = source_file.stat()
+                if (
+                    after_hash.st_size != after_copy.st_size
+                    or after_hash.st_mtime_ns != after_copy.st_mtime_ns
+                ):
+                    raise ReproError(
+                        f"Source changed while copying {relative}; rerun sync for a stable snapshot",
+                        EXIT_CONFLICT,
+                    )
+                os.replace(temporary, destination)
+            finally:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+            copied += 1
+            snapshot_files.append(
+                {"path": relative.as_posix(), "bytes": before.st_size, "sha256": source_hash}
+            )
+        for item in snapshot_files:
+            destination = target / item["path"]
+            if (
+                not destination.is_file()
+                or destination.is_symlink()
+                or destination.stat().st_size != item["bytes"]
+                or sha256_file(destination) != item["sha256"]
+            ):
+                raise ReproError(f"Target verification failed for {item['path']}", EXIT_EXEC)
+        receipt = {
+            "schema": "energy-repro/sync-receipt/v1",
+            "status": "partial" if active else "complete",
+            "run_id": args.run_id,
+            "source_state": source_state,
+            "completed_at": utc_now(),
+            "source_manifest_sha256": sha256_file(manifest_path) if manifest_path.is_file() else None,
+            "target": str(target),
+            "copied_files": copied,
+            "total_files": len(files),
+            "verified": True,
+            "files": snapshot_files,
+        }
+        atomic_json(target / ".energy-repro-sync.json", receipt)
+        receipt_name = sha256_bytes(str(target).encode("utf-8"))[:16] + ".json"
+        atomic_json(source / "sync" / "receipts" / receipt_name, receipt)
+        return {
+            "status": "PARTIAL" if active else "PASS",
+            **plan,
+            "copied_files": copied,
+            "receipt": receipt,
+        }
+    finally:
+        if stage_lock_file is not None:
+            stage_lock_file.close()
+
+
+def verify_manifest(run_root: Path, manifest: dict[str, Any], deep: bool) -> dict[str, Any]:
+    errors: list[str] = []
+    checked = 0
+    if manifest.get("schema") != "energy-repro/manifest/v1":
+        errors.append("unsupported or missing manifest schema")
+    if manifest.get("run_id") != run_root.name:
+        errors.append("manifest run_id does not match its directory")
+    if manifest.get("state") not in {"planned", "running", "succeeded", "failed", "interrupted"}:
+        errors.append("manifest has an invalid state")
+    plan = manifest.get("plan")
+    plan_path = run_root / "plan.json"
+    if not isinstance(plan, dict) or not plan_path.is_file():
+        errors.append("manifest and plan.json are required")
+    else:
+        try:
+            saved_plan = read_json(plan_path)
+        except ReproError as exc:
+            errors.append(str(exc))
+        else:
+            if saved_plan != plan:
+                errors.append("manifest plan does not match plan.json")
+        if plan.get("run_id") != manifest.get("run_id"):
+            errors.append("plan run_id does not match manifest")
+        plan_payload = dict(plan)
+        claimed_plan_hash = str(plan_payload.pop("plan_sha256", ""))
+        plan_payload.pop("run_id", None)
+        actual_plan_hash = sha256_bytes(canonical_bytes(plan_payload))
+        if claimed_plan_hash != actual_plan_hash:
+            errors.append("plan_sha256 does not match canonical plan content")
+        recipe_name = str(plan.get("recipe") or "")
+        run_name = "telemetry-smoke" if recipe_name == "telemetry" else recipe_name
+        try:
+            expected_run_id = (
+                f"{run_name}__{plan['profile']}__seed-{int(plan['seed'])}__"
+                f"attempt-{int(plan['attempt']):03d}__{actual_plan_hash[:8]}"
+            )
+        except (KeyError, TypeError, ValueError):
+            errors.append("plan is missing valid run identity fields")
+        else:
+            if expected_run_id != manifest.get("run_id"):
+                errors.append("run_id is not bound to the canonical plan")
+        upstream = read_json(BUNDLE / "upstream.lock.json")
+        expected_bindings = {
+            "upstream_commit": upstream["commit"],
+            "upstream_archive_sha256": upstream["archive_sha256"],
+            "asset_lock_sha256": sha256_file(BUNDLE / "assets.lock.json"),
+            "dependency_lock_sha256": sha256_file(BUNDLE / "locks" / "core-py310-cu124.txt"),
+        }
+        for key, expected in expected_bindings.items():
+            if plan.get(key) != expected:
+                errors.append(f"plan {key} does not match the current bundle")
+        profile_name = plan.get("profile")
+        if isinstance(profile_name, str):
+            try:
+                expected_profile_hash = sha256_file(profile_path(profile_name))
+            except ReproError as exc:
+                errors.append(str(exc))
+            else:
+                if plan.get("profile_sha256") != expected_profile_hash:
+                    errors.append("plan profile_sha256 does not match the current bundle")
+        if recipe_name and recipe_name != "telemetry":
+            try:
+                expected_recipe_hash = sha256_file(recipe_path(recipe_name))
+            except ReproError as exc:
+                errors.append(str(exc))
+            else:
+                if plan.get("recipe_sha256") != expected_recipe_hash:
+                    errors.append("plan recipe_sha256 does not match the current bundle")
+    state_path = run_root / "state.json"
+    if not state_path.is_file():
+        errors.append("state.json is missing")
+    else:
+        try:
+            run_state = read_json(state_path)
+        except ReproError as exc:
+            errors.append(str(exc))
+        else:
+            if run_state.get("schema") != "energy-repro/run-state/v1":
+                errors.append("state.json has an invalid schema")
+            if run_state.get("state") != manifest.get("state"):
+                errors.append("state.json and manifest state differ")
+            if run_state.get("exit_code") != manifest.get("exit_code"):
+                errors.append("state.json and manifest exit_code differ")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        errors.append("manifest artifacts must be a list")
+        artifacts = []
+    seen: set[str] = set()
+    for item in artifacts:
+        if not isinstance(item, dict):
+            errors.append("manifest contains a non-object artifact")
+            continue
+        if item.get("type") != "file":
+            errors.append(f"non-regular artifact recorded: {item.get('path')}")
+            continue
+        relative = item.get("path", "")
+        if not isinstance(relative, str) or not relative or relative in seen:
+            errors.append(f"invalid or duplicate artifact path: {relative!r}")
+            continue
+        seen.add(relative)
+        path = run_root / relative
+        if not under(path, run_root) or not path.is_file() or path.is_symlink():
+            errors.append(f"missing or unsafe artifact: {relative}")
+            continue
+        if path.stat().st_size != item.get("bytes"):
+            errors.append(f"size mismatch: {relative}")
+            continue
+        expected = item.get("sha256")
+        if expected or deep:
+            actual = sha256_file(path)
+            checked += 1
+            if expected and actual != expected:
+                errors.append(f"SHA-256 mismatch: {relative}")
+    actual_inventory = artifact_inventory(run_root)
+    if artifacts != actual_inventory:
+        expected_paths = {str(item.get("path")) for item in artifacts if isinstance(item, dict)}
+        actual_paths = {str(item.get("path")) for item in actual_inventory}
+        missing = sorted(expected_paths - actual_paths)
+        unrecorded = sorted(actual_paths - expected_paths)
+        if missing:
+            errors.append(f"recorded artifacts missing from disk: {missing}")
+        if unrecorded:
+            errors.append(f"unrecorded artifacts exist on disk: {unrecorded}")
+        if not missing and not unrecorded:
+            errors.append("artifact inventory metadata differs from the manifest")
+    return {"status": "FAIL" if errors else "PASS", "checked_hashes": checked, "errors": errors}
+
+
+def command_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    if not SAFE_NAME.fullmatch(args.run_id):
+        raise ReproError(f"Invalid run ID: {args.run_id!r}", EXIT_ARGS)
+    _, runs, _ = resolved_dirs(args)
+    run_root = runs / args.run_id
+    path = run_root / "manifest.json"
+    if not path.is_file():
+        raise ReproError(f"Manifest does not exist: {path}", EXIT_PREREQ)
+    manifest = read_json(path)
+    result: dict[str, Any] = {"status": "PASS", "path": str(path), "manifest": manifest}
+    if args.verify:
+        verification = verify_manifest(run_root, manifest, args.deep)
+        result["verification"] = verification
+        if verification["errors"]:
+            raise ReproError("Manifest verification failed", EXIT_POLICY, result)
+    return result
+
+
+def common_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--profile",
+        default=os.environ.get("ENERGY_REPRO_PROFILE", "h100-portable"),
+        choices=("upstream-exact", "paper-strict", "h100-portable"),
+    )
+    common.add_argument(
+        "--cache-dir",
+        default=os.environ.get("ENERGY_REPRO_CACHE", str(BUNDLE / ".cache")),
+    )
+    common.add_argument(
+        "--runs-dir",
+        default=os.environ.get("ENERGY_REPRO_RUNS", str(BUNDLE / "runs")),
+    )
+    common.add_argument(
+        "--state-dir",
+        default=os.environ.get("ENERGY_REPRO_STATE", str(BUNDLE / ".state")),
+    )
+    common.add_argument(
+        "--runtime",
+        default=os.environ.get("ENERGY_REPRO_RUNTIME", "docker"),
+        choices=("docker",),
+    )
+    common.add_argument("--image", help="OCI image ref; prefer registry/name@sha256:<digest>")
+    common.add_argument("--dry-run", action="store_true")
+    common.add_argument("--json", action="store_true")
+    return common
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="repro",
+        description="Reproducibility capsule for StellarLuminosity/Energy @ a3b76e8",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    common = common_parser()
+
+    doctor = subparsers.add_parser("doctor", parents=[common], help="Read-only environment validation")
+    doctor.add_argument("--mode", choices=("static", "host", "runtime"), default="runtime")
+    doctor.set_defaults(handler=command_doctor)
+
+    bootstrap = subparsers.add_parser("bootstrap", parents=[common], help="Prepare pinned source and image")
+    bootstrap.add_argument("--offline", action="store_true")
+    bootstrap.add_argument("--build-image", action="store_true")
+    bootstrap.set_defaults(handler=command_bootstrap)
+
+    fetch = subparsers.add_parser("fetch-assets", parents=[common], help="Fetch immutable Hub snapshots")
+    fetch.add_argument("--set", dest="asset_set", required=True)
+    fetch.add_argument("--offline", action="store_true")
+    fetch.add_argument("--verify-only", action="store_true")
+    fetch.set_defaults(handler=command_fetch_assets)
+
+    smoke = subparsers.add_parser("smoke", parents=[common], help="Run a short H100 telemetry smoke")
+    smoke.add_argument("--kind", choices=("telemetry", "pipeline"), default="telemetry")
+    smoke.add_argument("--recipe")
+    smoke.add_argument("--attempt", type=int, default=1)
+    smoke.set_defaults(handler=command_smoke)
+
+    run = subparsers.add_parser("run", parents=[common], help="Run one explicit experiment stage")
+    run.add_argument("--recipe", required=True)
+    run.add_argument("--stage", required=True, choices=("preprocess", "teacher", "student", "eval", "all"))
+    run.add_argument("--seed", type=int, default=42)
+    run.add_argument("--attempt", type=int, default=1)
+    run.add_argument("--ack-known-deviations", action="store_true")
+    run.set_defaults(handler=command_run)
+
+    sync = subparsers.add_parser("sync", parents=[common], help="Incrementally copy a run to persistent storage")
+    sync.add_argument("run_id")
+    sync.add_argument("--to", required=True)
+    sync.add_argument(
+        "--verify",
+        action="store_true",
+        help="Compatibility flag; SHA-256 verification is always enabled",
+    )
+    sync.set_defaults(handler=command_sync)
+
+    manifest = subparsers.add_parser("manifest", parents=[common], help="Display or verify a run manifest")
+    manifest.add_argument("run_id")
+    manifest.add_argument("--verify", action="store_true")
+    manifest.add_argument("--deep", action="store_true")
+    manifest.set_defaults(handler=command_manifest)
+    return parser
+
+
+def validate_numbers(args: argparse.Namespace) -> None:
+    for name in ("attempt",):
+        if hasattr(args, name) and getattr(args, name) < 1:
+            raise ReproError(f"--{name} must be at least 1", EXIT_ARGS)
+    if hasattr(args, "seed") and args.seed < 0:
+        raise ReproError("--seed must be non-negative", EXIT_ARGS)
+
+
+def main(argv: list[str] | None = None) -> int:
+    os.umask(0o027)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        validate_numbers(args)
+        result = args.handler(args)
+        emit(args, result)
+        return 0
+    except ReproError as exc:
+        payload = {"status": "ERROR", "code": exc.code, "error": str(exc)}
+        if exc.details is not None:
+            payload["details"] = exc.details
+        emit(args, payload)
+        return exc.code
+    except KeyboardInterrupt:
+        emit(args, {"status": "INTERRUPTED", "code": 130})
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

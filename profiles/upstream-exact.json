@@ -1,0 +1,33 @@
+{
+  "schema": "energy-repro/profile/v1",
+  "name": "upstream-exact",
+  "description": "Code-faithful execution of the pinned upstream commit with no scientific source patches.",
+  "source_mode": "upstream-exact",
+  "compliance_label": "code-faithful-not-paper-validated",
+  "runnable_stages": [
+    "smoke",
+    "preprocess",
+    "teacher",
+    "student"
+  ],
+  "blocked_stages": {
+    "eval": "The released evaluation dependency/protocol is incomplete and MT-Bench-101 is not commit-pinned.",
+    "all": "The released commit has no runnable baseline-SFT path and no trustworthy end-to-end/resume orchestration."
+  },
+  "hardware": {
+    "gpu_count": 1,
+    "gpu_name_contains": "H100",
+    "min_vram_mib": 79000,
+    "power_limit_watts": null,
+    "cpu_name_contains": null,
+    "min_ram_gib": 240,
+    "require_rapl": false
+  },
+  "energy_overrides": {
+    "track_cpu": true,
+    "total_energy_policy": "measured",
+    "rapl_root": "/sys/class/powercap"
+  },
+  "requires_known_deviations_ack": true
+}
+

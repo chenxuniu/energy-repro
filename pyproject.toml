@@ -1,0 +1,50 @@
+[project]
+name = "energy-repro-environment"
+version = "0.1.0"
+description = "Locked runtime environment for StellarLuminosity/Energy at a3b76e8"
+requires-python = "==3.10.13"
+dependencies = [
+  "torch==2.6.0+cu124",
+  "transformers==4.51.3",
+  "datasets>=2.14.0",
+  "trl==0.17.0",
+  "numpy>=1.24.0,<2.0",
+  "scipy>=1.10.0",
+  "pandas<2.0",
+  "accelerate>=0.25.0",
+  "huggingface-hub>=0.16.0",
+  "safetensors>=0.4.0",
+  "codecarbon",
+  "nvidia-ml-py",
+  "psutil",
+  "PyYAML>=6.0",
+  "tqdm==4.67.1",
+  "traitlets==5.14.3",
+  "triton==3.2.0",
+  "typing-inspection==0.4.0",
+  "typing_extensions==4.13.2",
+  "tzdata==2025.2",
+  "urllib3==2.4.0",
+  "wcwidth==0.2.13",
+  "xxhash==3.5.0",
+  "yarl==1.20.0",
+  "wandb"
+]
+
+[tool.uv]
+package = false
+environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'"
+]
+required-environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'"
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+

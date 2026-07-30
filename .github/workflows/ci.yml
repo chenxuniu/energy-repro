@@ -1,0 +1,74 @@
+name: Validate capsule
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install host Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.10.13
+
+      - name: Install validation tools
+        run: python -m pip install --disable-pip-version-check uv==0.6.14 PyYAML==6.0.3
+
+      - name: Verify dependency lock
+        run: uv lock --check --offline
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate all dry-run plans
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix_root="$(mktemp -d)"
+          export ENERGY_REPRO_CACHE="${matrix_root}/cache"
+          export ENERGY_REPRO_RUNS="${matrix_root}/runs"
+          export ENERGY_REPRO_STATE="${matrix_root}/state"
+
+          count=0
+          for profile in upstream-exact h100-portable; do
+            for recipe in kd-1b kd-7b kd-13b sft-1b sft-7b sft-13b; do
+              for stage in preprocess teacher student; do
+                ./repro run \
+                  --profile "${profile}" \
+                  --recipe "${recipe}" \
+                  --stage "${stage}" \
+                  --seed 42 \
+                  --attempt 1 \
+                  --ack-known-deviations \
+                  --dry-run \
+                  --json >/dev/null
+                count=$((count + 1))
+              done
+            done
+          done
+
+          for profile in upstream-exact paper-strict h100-portable; do
+            ./repro doctor --profile "${profile}" --dry-run --json >/dev/null
+            ./repro smoke \
+              --profile "${profile}" \
+              --kind telemetry \
+              --dry-run \
+              --json >/dev/null
+            count=$((count + 2))
+          done
+
+          test "${count}" -eq 42
+          test ! -e "${ENERGY_REPRO_CACHE}"
+          test ! -e "${ENERGY_REPRO_RUNS}"
+          test ! -e "${ENERGY_REPRO_STATE}"
+          echo "Validated ${count} dry-run plans."

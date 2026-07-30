@@ -1,0 +1,14 @@
+{
+  "schema": "energy-repro/recipe/v1",
+  "name": "kd-1b",
+  "pipeline": "kd",
+  "upstream_config": "configs/experiments/kd_32b_to_1b.yaml",
+  "teacher": "allenai/OLMo-2-0325-32B-SFT",
+  "student": "allenai/OLMo-2-0425-1B",
+  "dataset": "allenai/tulu-3-sft-mixture",
+  "asset_set": "kd-1b",
+  "preprocess_script": "tulu_preprocess_dataset",
+  "teacher_script": "logit_caching",
+  "estimated_min_ram_gib": 240
+}
+

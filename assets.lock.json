@@ -1,0 +1,118 @@
+{
+  "schema": "energy-repro/assets-lock/v1",
+  "observed_at": "2026-07-30",
+  "provenance_note": "The paper and pinned source do not publish Hugging Face commit revisions. These are immutable revisions resolved from each repository's main branch on the observed date; they are reproducible, but are not claimed to be the authors' original snapshots.",
+  "expected_bytes_note": "Exact sum of files selected by snapshot_download at the locked revision, resolved from the Hugging Face API with blob metadata on 2026-07-30.",
+  "assets": {
+    "teacher-32b": {
+      "kind": "model",
+      "repository": "allenai/OLMo-2-0325-32B-SFT",
+      "revision": "ce177b3fadb4070b8cfc9e5e522aa9e709488e72",
+      "paper_revision_status": "not-reported",
+      "expected_bytes": 64471809339
+    },
+    "student-1b": {
+      "kind": "model",
+      "repository": "allenai/OLMo-2-0425-1B",
+      "revision": "a1847dff35000b4271fa70afc5db10fd29fedbdf",
+      "paper_revision_status": "not-reported",
+      "expected_bytes": 5949386929
+    },
+    "student-7b": {
+      "kind": "model",
+      "repository": "allenai/OLMo-2-1124-7B",
+      "revision": "7df9a82518afdecae4e8c026b27adccc8c1f0032",
+      "paper_revision_status": "not-reported",
+      "expected_bytes": 29204223853
+    },
+    "student-13b": {
+      "kind": "model",
+      "repository": "allenai/OLMo-2-1124-13B",
+      "revision": "3fefddc1bf18a30e1d9b91000271630718f2aa8b",
+      "paper_revision_status": "not-reported",
+      "expected_bytes": 54874565905
+    },
+    "tokenizer-7b-sft": {
+      "kind": "model",
+      "repository": "allenai/OLMo-2-1124-7B-SFT",
+      "revision": "1de02c0175118a9de5854aec80a1f970e701e928",
+      "paper_revision_status": "not-reported",
+      "allow_patterns": [
+        "tokenizer*",
+        "special_tokens_map.json",
+        "config.json"
+      ],
+      "expected_bytes": 7143317
+    },
+    "tulu-3": {
+      "kind": "dataset",
+      "repository": "allenai/tulu-3-sft-mixture",
+      "revision": "b14afda60f1bbebe55d5d2fa1e4df5042f97f8be",
+      "paper_revision_status": "not-reported",
+      "expected_bytes": 1412964994
+    },
+    "codeforces-cots": {
+      "kind": "dataset",
+      "repository": "open-r1/codeforces-cots",
+      "revision": "39ac85c150806230473c70ad72c31f6232fe3f41",
+      "paper_revision_status": "not-reported",
+      "expected_bytes": 9689289170
+    },
+    "openr1-math-220k": {
+      "kind": "dataset",
+      "repository": "open-r1/OpenR1-Math-220k",
+      "revision": "e4e141ec9dea9f8326f4d347be56105859b2bd68",
+      "paper_revision_status": "not-reported",
+      "expected_bytes": 12649350862
+    }
+  },
+  "sets": {
+    "smoke": [],
+    "kd-1b": [
+      "teacher-32b",
+      "student-1b",
+      "tokenizer-7b-sft",
+      "tulu-3"
+    ],
+    "kd-7b": [
+      "teacher-32b",
+      "student-7b",
+      "tokenizer-7b-sft",
+      "tulu-3"
+    ],
+    "kd-13b": [
+      "teacher-32b",
+      "student-13b",
+      "tokenizer-7b-sft",
+      "tulu-3"
+    ],
+    "sft-1b": [
+      "teacher-32b",
+      "student-1b",
+      "tokenizer-7b-sft",
+      "tulu-3"
+    ],
+    "sft-7b": [
+      "teacher-32b",
+      "student-7b",
+      "tokenizer-7b-sft",
+      "tulu-3"
+    ],
+    "sft-13b": [
+      "teacher-32b",
+      "student-13b",
+      "tokenizer-7b-sft",
+      "tulu-3"
+    ],
+    "all-core": [
+      "teacher-32b",
+      "student-1b",
+      "student-7b",
+      "student-13b",
+      "tokenizer-7b-sft",
+      "tulu-3",
+      "codeforces-cots",
+      "openr1-math-220k"
+    ]
+  }
+}

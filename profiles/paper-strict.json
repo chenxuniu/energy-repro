@@ -1,0 +1,39 @@
+{
+  "schema": "energy-repro/profile/v1",
+  "name": "paper-strict",
+  "description": "Fail-closed profile for the hardware and software contract stated in arXiv:2605.13981v1.",
+  "source_mode": "paper-intent",
+  "compliance_label": "paper-strict-blocked-pending-audited-patches",
+  "runnable_stages": [
+    "smoke"
+  ],
+  "blocked_stages": {
+    "preprocess": "Deterministic preprocessing patch is not yet validated.",
+    "teacher": "Synthetic batching/token-budget and teacher-artifact semantics require audited patches.",
+    "student": "Optimizer-step, early-stopping, best-checkpoint, and resume semantics differ from the paper.",
+    "eval": "The five-benchmark protocol and MT-Bench judge stack are not fully released/pinned.",
+    "all": "The released commit lacks a runnable baseline-SFT branch and the complete 3x3 grid cannot be claimed."
+  },
+  "hardware": {
+    "gpu_count": 1,
+    "gpu_name_contains": "H100",
+    "min_vram_mib": 79000,
+    "power_limit_watts": 700,
+    "cpu_name_contains": "Intel(R) Xeon(R) Gold 6442Y",
+    "min_ram_gib": 1900,
+    "require_rapl": true
+  },
+  "software": {
+    "python": "3.10.13",
+    "pytorch": "2.6.0+cu124",
+    "cuda_userspace": "12.4",
+    "transformers": "4.51.3"
+  },
+  "energy_overrides": {
+    "track_cpu": true,
+    "total_energy_policy": "measured",
+    "rapl_root": "/sys/class/powercap"
+  },
+  "requires_known_deviations_ack": false
+}
+
