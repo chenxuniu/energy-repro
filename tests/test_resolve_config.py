@@ -348,6 +348,53 @@ training:
             metadata_b["hashes"]["resolved_yaml_sha256"],
         )
 
+    def test_pilot_recipe_policy_and_metadata_are_preserved(self) -> None:
+        recipe = json.loads(self.recipe_path.read_text(encoding="utf-8"))
+        recipe.update(
+            {
+                "classification": "workflow-pilot-not-paper-reproduction",
+                "allowed_profiles": ["h100-portable"],
+                "pilot": {
+                    "enabled": True,
+                    "classification": "workflow-pilot-not-paper-reproduction",
+                },
+                "config_overrides": {
+                    "energy_repro_pilot": {
+                        "classification": "workflow-pilot-not-paper-reproduction",
+                        "train_examples": 8,
+                        "eval_examples": 2,
+                        "candidate_multiplier": 2,
+                        "workers": 1,
+                    }
+                },
+            }
+        )
+        self.recipe_path.write_text(json.dumps(recipe), encoding="utf-8")
+
+        config, metadata, _ = self._resolve(stage="smoke", formal=False)
+
+        self.assertEqual(
+            config["energy_repro_pilot"]["classification"],
+            "workflow-pilot-not-paper-reproduction",
+        )
+        self.assertTrue(metadata["recipe"]["pilot"])
+        self.assertEqual(
+            metadata["runtime_environment"]["WANDB_MODE"],
+            "disabled",
+        )
+        self.assertEqual(
+            metadata["recipe"]["classification"],
+            "workflow-pilot-not-paper-reproduction",
+        )
+
+        recipe["pilot"]["classification"] = "paper-reproduction"
+        self.recipe_path.write_text(json.dumps(recipe), encoding="utf-8")
+        with self.assertRaisesRegex(
+            self.module.ConfigResolutionError,
+            "workflow-pilot-not-paper-reproduction",
+        ):
+            self._resolve(stage="smoke", formal=False)
+
     def test_formal_mode_rejects_unresolved_placeholder(self) -> None:
         with self.base_path.open("a", encoding="utf-8") as handle:
             handle.write("custom_unresolved: /path/to/remain\n")
@@ -708,6 +755,85 @@ class ActualBundleConfigTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_actual_pilot_recipes_resolve_to_the_bounded_policy(self) -> None:
+        bundle = MODULE_PATH.parents[1]
+        upstream = bundle.parent / "tmp" / "Energy-a3b76e8"
+        if not upstream.is_dir():
+            self.skipTest("pinned upstream audit checkout is not available")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            lock = json.loads(
+                (bundle / "assets.lock.json").read_text(encoding="utf-8")
+            )
+            lock_path = root / "assets.lock.json"
+            lock_path.write_text(json.dumps(lock), encoding="utf-8")
+            provenance = self._provenance(root)
+            cases = {
+                "kd-1b-pilot": "kd_32b_to_1b.yaml",
+                "sft-1b-pilot": "sft_32b_to_1b.yaml",
+                "sft-original-1b-pilot": "sft_32b_to_1b.yaml",
+            }
+            for recipe_name, experiment_name in cases.items():
+                with self.subTest(recipe=recipe_name):
+                    config, metadata, yaml_text = self.module.resolve_config(
+                        base_path=upstream / "configs" / "base.yaml",
+                        experiment_path=upstream
+                        / "configs"
+                        / "experiments"
+                        / experiment_name,
+                        profile_path=bundle
+                        / "profiles"
+                        / "h100-portable.json",
+                        recipe_path=bundle
+                        / "recipes"
+                        / f"{recipe_name}.json",
+                        provenance_path=provenance,
+                        stage="smoke",
+                        run_root=root / recipe_name,
+                        assets_lock_path=lock_path,
+                        asset_cache=cache,
+                        seed=42,
+                        formal=False,
+                    )
+                    pilot = config["energy_repro_pilot"]
+                    self.assertEqual(
+                        pilot["classification"],
+                        "workflow-pilot-not-paper-reproduction",
+                    )
+                    self.assertEqual(
+                        pilot["train_examples"] + pilot["eval_examples"],
+                        128,
+                    )
+                    self.assertFalse(config["experiment"]["debug_mode"])
+                    self.assertEqual(config["data"]["max_sequence_length"], 1024)
+                    self.assertEqual(config["training"]["batch_size"], 1)
+                    self.assertEqual(config["training"]["eval_batch_size"], 1)
+                    self.assertEqual(
+                        config["training"]["gradient_accumulation_steps"],
+                        1,
+                    )
+                    self.assertEqual(config["training"]["num_epochs"], 1)
+                    self.assertFalse(config["wandb"]["enabled"])
+                    self.assertTrue(metadata["recipe"]["pilot"])
+                    self.assertEqual(
+                        metadata["runtime_environment"]["WANDB_MODE"],
+                        "disabled",
+                    )
+                    self.assertNotIn("/path/to/", yaml_text)
+                    if recipe_name == "sft-1b-pilot":
+                        self.assertEqual(config["batch_size"], 1)
+                        self.assertEqual(
+                            config["synthetic_data"]["max_gen_examples"],
+                            64,
+                        )
+                        self.assertEqual(
+                            config["synthetic_data"]["generation"][
+                                "decoding_strategy"
+                            ],
+                            "greedy",
+                        )
+
     def test_actual_kd_1b_stage_configs_have_no_placeholders(self) -> None:
         bundle = MODULE_PATH.parents[1]
         upstream = bundle.parent / "tmp" / "Energy-a3b76e8"
@@ -814,6 +940,68 @@ class ActualBundleConfigTests(unittest.TestCase):
             self.assertEqual(
                 student_config["synthetic_data"]["synthetic_dataset_path"],
                 teacher_metadata["derived_artifacts"]["synthetic_dataset"]["path"],
+            )
+
+    def test_actual_original_sft_pilot_uses_preprocessed_artifact_directly(self) -> None:
+        bundle = MODULE_PATH.parents[1]
+        upstream = bundle.parent / "tmp" / "Energy-a3b76e8"
+        if not upstream.is_dir():
+            self.skipTest("pinned upstream audit checkout is not available")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            lock = json.loads(
+                (bundle / "assets.lock.json").read_text(encoding="utf-8")
+            )
+            for asset_id, spec in lock["assets"].items():
+                spec["expected_bytes"] = len(asset_id.encode("utf-8"))
+            test_lock_path = root / "assets.lock.json"
+            test_lock_path.write_text(json.dumps(lock), encoding="utf-8")
+            for asset_id in ("tokenizer-7b-sft", "tulu-3"):
+                self._publish_asset(cache, lock, asset_id)
+            kwargs = dict(
+                base_path=upstream / "configs" / "base.yaml",
+                experiment_path=upstream
+                / "configs"
+                / "experiments"
+                / "sft_32b_to_1b.yaml",
+                profile_path=bundle / "profiles" / "h100-portable.json",
+                recipe_path=bundle
+                / "recipes"
+                / "sft-original-1b-pilot.json",
+                provenance_path=self._provenance(root),
+                run_root=root / "run",
+                assets_lock_path=test_lock_path,
+                asset_cache=cache,
+                seed=42,
+                formal=True,
+            )
+            _, preprocess_metadata, _ = self.module.resolve_config(
+                stage="preprocess",
+                **kwargs,
+            )
+            self._publish_derived(preprocess_metadata, "preprocessed")
+            self._publish_asset(cache, lock, "student-1b")
+            student_config, student_metadata, student_yaml = (
+                self.module.resolve_config(stage="student", **kwargs)
+            )
+            preprocessed_path = student_metadata["derived_artifacts"][
+                "preprocessed"
+            ]["path"]
+            self.assertNotIn("/path/to/", student_yaml)
+            self.assertEqual(
+                student_config["synthetic_data"]["synthetic_dataset_path"],
+                preprocessed_path,
+            )
+            self.assertTrue(
+                student_metadata["derived_artifacts"]["preprocessed"][
+                    "required_for_stage"
+                ]
+            )
+            self.assertFalse(
+                student_metadata["derived_artifacts"]["synthetic_dataset"][
+                    "required_for_stage"
+                ]
             )
 
 

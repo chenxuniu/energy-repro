@@ -1,0 +1,55 @@
+{
+  "schema": "energy-repro/recipe/v1",
+  "name": "kd-1b-pilot",
+  "description": "Bounded 32B-to-1B KD workflow pilot for short-lived single-H100 leases.",
+  "classification": "workflow-pilot-not-paper-reproduction",
+  "allowed_profiles": [
+    "h100-portable"
+  ],
+  "pipeline": "kd",
+  "upstream_config": "configs/experiments/kd_32b_to_1b.yaml",
+  "teacher": "allenai/OLMo-2-0325-32B-SFT",
+  "student": "allenai/OLMo-2-0425-1B",
+  "dataset": "allenai/tulu-3-sft-mixture",
+  "asset_set": "kd-1b",
+  "preprocess_tool": "pilot_preprocess.py",
+  "teacher_tool": "pilot_teacher.py",
+  "teacher_script": "logit_caching",
+  "estimated_min_ram_gib": 240,
+  "pilot": {
+    "enabled": true,
+    "classification": "workflow-pilot-not-paper-reproduction"
+  },
+  "config_overrides": {
+    "energy_repro_pilot": {
+      "classification": "workflow-pilot-not-paper-reproduction",
+      "train_examples": 96,
+      "eval_examples": 32,
+      "candidate_multiplier": 4,
+      "workers": 1
+    },
+    "experiment": {
+      "name": "kd_32b_to_1b_workflow_pilot",
+      "description": "Bounded workflow validation only; not a paper reproduction.",
+      "debug_mode": false,
+      "debug_max_steps": 32
+    },
+    "data": {
+      "max_sequence_length": 1024
+    },
+    "training": {
+      "batch_size": 1,
+      "eval_batch_size": 1,
+      "gradient_accumulation_steps": 1,
+      "num_epochs": 1,
+      "num_training_steps": 0,
+      "num_warmup_steps": 8,
+      "eval_steps": 1000000,
+      "save_steps": 1000000
+    },
+    "wandb": {
+      "enabled": false,
+      "run_name": "kd_32b_to_1b_workflow_pilot"
+    }
+  }
+}

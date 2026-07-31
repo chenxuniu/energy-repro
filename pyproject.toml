@@ -1,6 +1,6 @@
 [project]
 name = "energy-repro-environment"
-version = "0.1.0"
+version = "0.2.0"
 description = "Locked runtime environment for StellarLuminosity/Energy at a3b76e8"
 requires-python = "==3.10.13"
 dependencies = [
@@ -47,4 +47,3 @@ torch = { index = "pytorch-cu124" }
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
-

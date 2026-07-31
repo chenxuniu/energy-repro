@@ -74,6 +74,35 @@ class BundleTests(unittest.TestCase):
             r"torch==2\.6\.0\+cu124[^\n]*\\\n\s+--hash=sha256:[0-9a-f]{64}",
         )
 
+    def test_host_setup_is_guarded_and_does_not_install_a_driver(self) -> None:
+        path = ROOT / "scripts" / "setup_docker_nvidia_ubuntu.sh"
+        script = path.read_text(encoding="utf-8")
+        self.assertTrue(path.stat().st_mode & 0o111)
+        self.assertIn("nvidia-smi", script)
+        self.assertIn("26.04", script)
+        self.assertIn('NVIDIA_CONTAINER_TOOLKIT_VERSION="1.19.1-1"', script)
+        self.assertIn("conflicting/provider-managed packages detected", script)
+        self.assertIn("ENERGY_REPRO_ALLOW_PROVIDER_DOCKER_MUTATION", script)
+        self.assertIn(
+            "no host packages or configuration were changed",
+            script,
+        )
+        self.assertNotIn("nvidia-driver-", script)
+        self.assertNotIn("apt-get remove", script)
+
+    def test_short_lease_docs_use_persistent_unique_attempt_and_python3(self) -> None:
+        for name in ("PILOT.md", "QUICKSTART.md"):
+            with self.subTest(document=name):
+                text = (ROOT / name).read_text(encoding="utf-8")
+                self.assertIn("/root/energy-repro.env", text)
+                self.assertIn("ENERGY_REPRO_ATTEMPT", text)
+                self.assertNotIn("--attempt 1", text)
+                self.assertNotIn("python tools/export_results.py", text)
+        results_text = (ROOT / "results" / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("python tools/export_results.py", results_text)
+
 
 class DryRunTests(unittest.TestCase):
     def test_dry_runs_are_hermetic_and_do_not_create_directories(self) -> None:
@@ -105,6 +134,25 @@ class DryRunTests(unittest.TestCase):
                     "kd-1b",
                     "--stage",
                     "preprocess",
+                    *common,
+                ),
+                (
+                    "run",
+                    "--profile",
+                    "h100-portable",
+                    "--recipe",
+                    "kd-1b-pilot",
+                    "--stage",
+                    "preprocess",
+                    *common,
+                ),
+                (
+                    "export-results",
+                    "fixture-run",
+                    "--output",
+                    str(base / "public-result"),
+                    "--archive",
+                    str(base / "public-result.tar.gz"),
                     *common,
                 ),
             ]
@@ -192,6 +240,197 @@ class DryRunTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertIn("blocks stage", payload["error"])
 
+    def test_pilot_recipe_uses_capsule_preprocessor_and_non_paper_label(self) -> None:
+        result = invoke(
+            "run",
+            "--profile",
+            "h100-portable",
+            "--recipe",
+            "kd-1b-pilot",
+            "--stage",
+            "preprocess",
+            "--ack-known-deviations",
+            "--dry-run",
+            "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["pilot"])
+        self.assertEqual(
+            payload["result_classification"],
+            "workflow-pilot-not-paper-reproduction",
+        )
+        self.assertEqual(
+            payload["plan"]["result_classification"],
+            "workflow-pilot-not-paper-reproduction",
+        )
+        self.assertIn(
+            "/opt/energy-repro/tools/pilot_preprocess.py",
+            payload["execution_argv"],
+        )
+        self.assertNotIn("tulu_preprocess_dataset", payload["execution_argv"])
+
+    def test_pilot_recipe_rejects_nonportable_profile(self) -> None:
+        result = invoke(
+            "run",
+            "--profile",
+            "upstream-exact",
+            "--recipe",
+            "kd-1b-pilot",
+            "--stage",
+            "preprocess",
+            "--dry-run",
+            "--json",
+        )
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("allowed only with profiles", json.loads(result.stdout)["error"])
+
+    def test_pilot_recipes_are_bounded_and_explicitly_classified(self) -> None:
+        for recipe_name in (
+            "kd-1b-pilot",
+            "sft-1b-pilot",
+            "sft-original-1b-pilot",
+        ):
+            with self.subTest(recipe=recipe_name):
+                recipe = json.loads(
+                    (ROOT / "recipes" / f"{recipe_name}.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    recipe["classification"],
+                    "workflow-pilot-not-paper-reproduction",
+                )
+                self.assertEqual(recipe["allowed_profiles"], ["h100-portable"])
+                self.assertEqual(recipe["preprocess_tool"], "pilot_preprocess.py")
+                if "teacher" in recipe.get(
+                    "allowed_stages",
+                    ["preprocess", "teacher", "student"],
+                ):
+                    self.assertEqual(recipe["teacher_tool"], "pilot_teacher.py")
+                pilot = recipe["config_overrides"]["energy_repro_pilot"]
+                self.assertGreater(pilot["train_examples"], 0)
+                self.assertGreater(pilot["eval_examples"], 0)
+                self.assertLessEqual(
+                    pilot["train_examples"] + pilot["eval_examples"],
+                    128,
+                )
+                self.assertFalse(
+                    recipe["config_overrides"]["experiment"]["debug_mode"]
+                )
+                training = recipe["config_overrides"]["training"]
+                self.assertEqual(training["num_epochs"], 1)
+                self.assertEqual(training["gradient_accumulation_steps"], 1)
+                self.assertGreaterEqual(
+                    min(training["eval_steps"], training["save_steps"]),
+                    1000,
+                )
+
+    def test_original_sft_pilot_rejects_teacher_stage(self) -> None:
+        result = invoke(
+            "run",
+            "--profile",
+            "h100-portable",
+            "--recipe",
+            "sft-original-1b-pilot",
+            "--stage",
+            "teacher",
+            "--dry-run",
+            "--json",
+        )
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("allows only stages", json.loads(result.stdout)["error"])
+
+    def test_pilot_teacher_stage_uses_seeded_capsule_wrapper(self) -> None:
+        result = invoke(
+            "run",
+            "--profile",
+            "h100-portable",
+            "--recipe",
+            "kd-1b-pilot",
+            "--stage",
+            "teacher",
+            "--ack-known-deviations",
+            "--dry-run",
+            "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        argv = json.loads(result.stdout)["execution_argv"]
+        self.assertIn("/opt/energy-repro/tools/pilot_teacher.py", argv)
+        self.assertNotIn("distill_bench.data.logit_caching", argv)
+
+    def test_pilot_stage_disables_wandb_at_the_process_boundary(self) -> None:
+        for recipe_name, stage in (
+            ("kd-1b-pilot", "student"),
+            ("sft-1b-pilot", "teacher"),
+            ("sft-original-1b-pilot", "student"),
+        ):
+            with self.subTest(recipe=recipe_name, stage=stage):
+                result = invoke(
+                    "run",
+                    "--profile",
+                    "h100-portable",
+                    "--recipe",
+                    recipe_name,
+                    "--stage",
+                    stage,
+                    "--ack-known-deviations",
+                    "--dry-run",
+                    "--json",
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    result.stdout + result.stderr,
+                )
+                argv = json.loads(result.stdout)["execution_argv"]
+                self.assertIn("WANDB_MODE=disabled", argv)
+                self.assertNotIn("WANDB_MODE=offline", argv)
+
+    def test_nonpilot_stage_preserves_offline_wandb_mode(self) -> None:
+        result = invoke(
+            "run",
+            "--profile",
+            "h100-portable",
+            "--recipe",
+            "kd-1b",
+            "--stage",
+            "student",
+            "--ack-known-deviations",
+            "--dry-run",
+            "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        argv = json.loads(result.stdout)["execution_argv"]
+        self.assertIn("WANDB_MODE=offline", argv)
+        self.assertNotIn("WANDB_MODE=disabled", argv)
+
+    def test_manifest_environment_matches_planned_pilot_wandb_mode(self) -> None:
+        module = load_repro_module()
+        profile = json.loads(
+            (ROOT / "profiles" / "h100-portable.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        pilot_manifest = module.initial_manifest(
+            {"run_id": "pilot", "pilot": True},
+            profile,
+            "planned",
+        )
+        regular_manifest = module.initial_manifest(
+            {"run_id": "regular", "pilot": False},
+            profile,
+            "planned",
+        )
+        self.assertEqual(
+            pilot_manifest["execution"]["environment"]["WANDB_MODE"],
+            "disabled",
+        )
+        self.assertEqual(
+            regular_manifest["execution"]["environment"]["WANDB_MODE"],
+            "offline",
+        )
+
     def test_secret_value_is_never_rendered(self) -> None:
         secret = "hf_" + "abcdefghijklmnopqrstuvwxyz" + "123456"
         result = invoke(
@@ -205,8 +444,62 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertNotIn(secret, result.stdout)
 
+    def test_export_results_dry_run_is_host_only_and_describes_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = invoke(
+                "export-results",
+                "fixture-run",
+                "--runs-dir",
+                str(root / "runs"),
+                "--output",
+                str(root / "public"),
+                "--archive",
+                str(root / "public.tar.gz"),
+                "--dry-run",
+                "--json",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["status"], "PLANNED")
+            self.assertIn("no models", payload["public_policy"])
+            self.assertFalse((root / "runs").exists())
+            self.assertFalse((root / "public").exists())
+            self.assertFalse((root / "public.tar.gz").exists())
+
+    def test_export_results_rejects_nonpositive_file_cap(self) -> None:
+        result = invoke(
+            "export-results",
+            "fixture-run",
+            "--output",
+            "/tmp/public-result",
+            "--max-file-bytes",
+            "0",
+            "--dry-run",
+            "--json",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be positive", json.loads(result.stdout)["error"])
+
 
 class LocalArtifactTests(unittest.TestCase):
+    def test_execution_provenance_binds_all_capsule_tools(self) -> None:
+        module = load_repro_module()
+        provenance = module.execution_provenance(
+            {
+                "labels": {
+                    "io.energy-repro.build-context-sha256": "a" * 64,
+                }
+            }
+        )
+        expected = {
+            path.name
+            for path in (ROOT / "tools").glob("*.py")
+        }
+        self.assertEqual(set(provenance["capsule_tools"]), expected)
+        for digest in provenance["capsule_tools"].values():
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
     def test_signal_exit_codes_are_recorded_as_interrupted(self) -> None:
         module = load_repro_module()
         self.assertEqual(module.execution_outcome(-2), ("interrupted", 130))

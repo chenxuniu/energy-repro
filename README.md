@@ -21,7 +21,8 @@ Pinned inputs:
 >
 > This toolset currently provides trustworthy environment preparation, asset
 > prefetching, an H100 telemetry smoke test, explicit
-> preprocessing/teacher/student stage execution, manifests, and synchronization.
+> preprocessing/teacher/student stage execution, bounded workflow pilots,
+> manifests, synchronization, and sanitized compact result export.
 > It cannot yet claim a complete reproduction of the paper's 3×3 main
 > experiments or its five evaluations. `paper-strict` therefore fails closed
 > instead of presenting an approximate pipeline that merely appears runnable as
@@ -35,7 +36,7 @@ Clone the immutable capsule release rather than a moving branch:
 
 ```bash
 git clone \
-  --branch v0.1.0-energy-a3b76e8 \
+  --branch v0.2.0-energy-a3b76e8 \
   --depth 1 \
   https://github.com/chenxuniu/energy-repro.git
 cd energy-repro
@@ -51,6 +52,36 @@ just three sets of performance parameters.
 | `upstream-exact` | Run the pinned commit unchanged, with no scientific source patches | `smoke`, `preprocess`, `teacher`, `student` | Code-faithful, but not validated at paper level |
 | `paper-strict` | Strictly require the hardware, software, and experimental semantics reported in the paper | Currently `smoke` only | Training and evaluation fail closed |
 | `h100-portable` | Reproduce the workflow and GPU energy measurement across single-H100 hosts | `smoke`, `preprocess`, `teacher`, `student` | GPU-comparable; CPU and total energy are not strictly comparable |
+
+## Short-lease workflow pilots
+
+Three recipes are intentionally bounded to at most 128 selected examples and
+one complete epoch. They are available only with `h100-portable` and every plan
+and manifest carries this classification:
+
+```text
+workflow-pilot-not-paper-reproduction
+```
+
+| Recipe | Download set | Stages | Recommended use |
+|---|---:|---|---|
+| `sft-original-1b-pilot` | approximately 7.4 GB | `preprocess`, `student` | First and simplest machine validation |
+| `kd-1b-pilot` | approximately 71.8 GB | `preprocess`, `teacher`, `student` | Bounded KD workflow |
+| `sft-1b-pilot` | approximately 71.8 GB | `preprocess`, `teacher`, `student` | Bounded greedy synthetic-SFT workflow |
+
+The pilot preprocessor selects 96 train and 32 evaluation examples
+deterministically, uses a 1,024-token limit, records split-order hashes, and
+refuses to overwrite a partial artifact. Pilot teacher stages are seeded; KD
+caching uses fixed sequential input order, and synthetic generation uses batch
+one, greedy decoding, at most 64 prompts, and at most 128 new tokens. Training
+uses batch/accumulation one and one complete epoch instead of the upstream
+debug-mode semantics. W&B is disabled at the container process boundary for
+all pilots, including the pinned KD pipeline that ignores its config flag.
+
+These recipes validate acquisition, preprocessing, teacher/student execution,
+energy telemetry, bounded completion, manifests, and result export. Their
+losses, energy, or model quality must not be compared with the paper's full
+experiments. See [PILOT.md](PILOT.md) for the short-lived-machine procedure.
 
 ### `upstream-exact`
 
@@ -133,8 +164,7 @@ doctor --dry-run
   → sync
 ```
 
-Place the cache and run directories on a mounted volume that survives the end
-of the lease, not on the temporary system disk:
+Choose explicit cache, run, and state directories:
 
 ```bash
 export ENERGY_REPRO_PROFILE=h100-portable
@@ -151,8 +181,10 @@ run under the caller's UID/GID, and the HF/datasets/torch runtime caches are
 written to `${ENERGY_REPRO_CACHE}/runtime` so bind-mounted artifacts do not
 become root-owned.
 
-If the machine has no persistent volume, you may leave `ENERGY_REPRO_RUNS` on
-the local disk, but you must run `sync` before the lease expires.
+On an isolated rental machine, `/mnt` may simply be local NVMe. That is a valid
+lease-local scratch layout; it is not persistent. Export every completed run
+and download it before releasing the machine. A shared persistent mount is an
+optional optimization, not a requirement for the pilot workflow.
 
 ### 1. Generate the check plan first
 
@@ -221,6 +253,7 @@ Other available sets are:
 ```text
 kd-7b   kd-13b
 sft-1b  sft-7b  sft-13b
+sft-original-1b-pilot
 all-core
 ```
 
@@ -266,9 +299,9 @@ energy, nonzero utilization, and ECC/row-remap status, and writes JSON output.
 It does not invoke the interface-incompatible upstream `prerun.py` from the
 pinned commit.
 
-`--kind pipeline` reserves an interface for a future tiny-step smoke test, but
-no audited bounded configuration exists yet. It can currently be used only to
-inspect a dry-run plan; real execution fails closed:
+`--kind pipeline` remains a reserved smoke-test interface and can currently be
+used only to inspect a dry-run plan; real execution fails closed. Use an
+explicit `*-pilot` recipe instead:
 
 ```bash
 ./repro smoke \
@@ -278,9 +311,7 @@ inspect a dry-run plan; real execution fails closed:
   --dry-run
 ```
 
-Until the semantics of the tiny-step configuration and teacher-derived input
-have been tested, do not treat this as a runnable pipeline smoke test, and never
-treat it as paper data.
+Do not treat this interface or any pilot result as paper data.
 
 ### 5. Run one stage explicitly
 
@@ -377,13 +408,16 @@ Formal runs set:
 ```text
 HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
-WANDB_MODE=offline
+WANDB_MODE=offline       # non-pilot recipes
+WANDB_MODE=disabled      # bounded pilot recipes
 ```
 
 The upstream KD pipeline calls `wandb.init()` even when W&B is disabled in its
-configuration, so the wrapper enforces offline mode. Local W&B files remain in
-the run directory. Any later upload must be performed separately after the
-experiment and is not part of the measured stage.
+configuration. Non-pilot recipes preserve its local offline logging, while
+pilot recipes disable W&B at the process boundary so it cannot create
+unnecessary files or symlinks. Any later upload of non-pilot offline data must
+be performed separately after the experiment and is not part of the measured
+stage.
 
 At runtime, only one selected GPU is exposed to the container. Pinned source and
 raw assets are mounted read-only. The current run directory and
@@ -441,6 +475,23 @@ current lock/profile/recipe bindings, `state.json`, and the equality
 "complete set of actual files = manifest inventory" instead of merely spot
 checking listed files.
 
+For an isolated rental node, create a small public-safe result bundle instead:
+
+```bash
+./repro manifest <RUN_ID> --verify
+./repro export-results <RUN_ID> \
+  --output "$PWD/results/<RUN_ID>" \
+  --archive "/root/<RUN_ID>.public.tar.gz"
+python3 tools/export_results.py --verify-export "$PWD/results/<RUN_ID>"
+```
+
+The exporter first verifies the source manifest's complete inventory and every
+SHA-256. It then includes sanitized metadata, compact energy/metric summaries,
+and numeric metrics parsed from logs. Raw log text, weights, checkpoints,
+datasets, assets, W&B files, oversized files, secrets, host identity, GPU UUIDs,
+and absolute paths are excluded. The public directory and deterministic archive
+carry their own receipt and `SHA256SUMS`.
+
 ## Cache and persistence layout
 
 Keep these directory classes separate:
@@ -485,8 +536,7 @@ The paper estimates that the complete experiment requires approximately 2,000
 H100 GPU-hours. A two-hour lease is suitable for:
 
 - New-machine doctor and telemetry smoke tests
-- A bounded pipeline smoke test after an audited tiny-step configuration becomes
-  available
+- One of the explicit bounded `*-pilot` recipes
 - A clearly scoped preprocessing task known to finish within the lease
 - A known-size portion of teacher artifact generation
 - Validating checkpoint, manifest, and synchronization paths
@@ -498,8 +548,8 @@ two hours.
 
 Recommended schedule:
 
-1. **Before the lease starts:** place the image and recipe asset set in the
-   persistent cache.
+1. **Before the lease starts, when possible:** place the image and recipe asset
+   set in a reusable cache. On an isolated machine, budget time for both.
 2. **T+0 to T+10 minutes:** run the real `doctor` and telemetry smoke test.
 3. **After T+10 minutes:** start only one explicit stage and record its run ID.
 4. **With approximately 20 minutes remaining:** start no new stage; generate the
@@ -585,7 +635,12 @@ energy-repro/
 │   └── h100-portable.json
 ├── recipes/
 │   ├── kd-{1b,7b,13b}.json
-│   └── sft-{1b,7b,13b}.json
+│   ├── sft-{1b,7b,13b}.json
+│   └── {kd-1b,sft-1b,sft-original-1b}-pilot.json
+├── scripts/
+│   └── setup_docker_nvidia_ubuntu.sh
+├── results/
+│   └── README.md
 └── patches/
     └── paper-intent/
         └── series.json
