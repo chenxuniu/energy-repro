@@ -92,6 +92,11 @@
       "tokenizer-7b-sft",
       "tulu-3"
     ],
+    "sft-original-1b-pilot": [
+      "student-1b",
+      "tokenizer-7b-sft",
+      "tulu-3"
+    ],
     "sft-7b": [
       "teacher-32b",
       "student-7b",

@@ -1,0 +1,61 @@
+{
+  "schema": "energy-repro/recipe/v1",
+  "name": "sft-original-1b-pilot",
+  "description": "Bounded direct SFT workflow pilot for the smallest first experiment on a short-lived single-H100 lease.",
+  "classification": "workflow-pilot-not-paper-reproduction",
+  "allowed_profiles": [
+    "h100-portable"
+  ],
+  "allowed_stages": [
+    "preprocess",
+    "student"
+  ],
+  "pipeline": "sft",
+  "sft_data_mode": "original",
+  "upstream_config": "configs/experiments/sft_32b_to_1b.yaml",
+  "student": "allenai/OLMo-2-0425-1B",
+  "dataset": "allenai/tulu-3-sft-mixture",
+  "asset_set": "sft-original-1b-pilot",
+  "preprocess_tool": "pilot_preprocess.py",
+  "teacher_script": "synthetic_generation",
+  "estimated_min_ram_gib": 240,
+  "pilot": {
+    "enabled": true,
+    "classification": "workflow-pilot-not-paper-reproduction"
+  },
+  "config_overrides": {
+    "energy_repro_pilot": {
+      "classification": "workflow-pilot-not-paper-reproduction",
+      "train_examples": 96,
+      "eval_examples": 32,
+      "candidate_multiplier": 4,
+      "workers": 1
+    },
+    "experiment": {
+      "name": "sft_original_1b_workflow_pilot",
+      "description": "Bounded direct SFT workflow validation only; not a paper reproduction.",
+      "debug_mode": false,
+      "debug_max_steps": 32
+    },
+    "model": {
+      "teacher": ""
+    },
+    "data": {
+      "max_sequence_length": 1024
+    },
+    "training": {
+      "batch_size": 1,
+      "eval_batch_size": 1,
+      "gradient_accumulation_steps": 1,
+      "num_epochs": 1,
+      "num_training_steps": 0,
+      "num_warmup_steps": 8,
+      "eval_steps": 1000000,
+      "save_steps": 1000000
+    },
+    "wandb": {
+      "enabled": false,
+      "run_name": "sft_original_1b_workflow_pilot"
+    }
+  }
+}

@@ -30,6 +30,9 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
+      - name: Validate guarded host bootstrap syntax
+        run: bash -n scripts/setup_docker_nvidia_ubuntu.sh
+
       - name: Validate all dry-run plans
         shell: bash
         run: |
@@ -57,6 +60,34 @@ jobs:
             done
           done
 
+          for recipe in kd-1b-pilot sft-1b-pilot; do
+            for stage in preprocess teacher student; do
+              ./repro run \
+                --profile h100-portable \
+                --recipe "${recipe}" \
+                --stage "${stage}" \
+                --seed 42 \
+                --attempt 1 \
+                --ack-known-deviations \
+                --dry-run \
+                --json >/dev/null
+              count=$((count + 1))
+            done
+          done
+
+          for stage in preprocess student; do
+            ./repro run \
+              --profile h100-portable \
+              --recipe sft-original-1b-pilot \
+              --stage "${stage}" \
+              --seed 42 \
+              --attempt 1 \
+              --ack-known-deviations \
+              --dry-run \
+              --json >/dev/null
+            count=$((count + 1))
+          done
+
           for profile in upstream-exact paper-strict h100-portable; do
             ./repro doctor --profile "${profile}" --dry-run --json >/dev/null
             ./repro smoke \
@@ -67,8 +98,18 @@ jobs:
             count=$((count + 2))
           done
 
-          test "${count}" -eq 42
+          ./repro export-results \
+            fixture-run \
+            --output "${matrix_root}/public-result" \
+            --archive "${matrix_root}/public-result.tar.gz" \
+            --dry-run \
+            --json >/dev/null
+          count=$((count + 1))
+
+          test "${count}" -eq 51
           test ! -e "${ENERGY_REPRO_CACHE}"
           test ! -e "${ENERGY_REPRO_RUNS}"
           test ! -e "${ENERGY_REPRO_STATE}"
+          test ! -e "${matrix_root}/public-result"
+          test ! -e "${matrix_root}/public-result.tar.gz"
           echo "Validated ${count} dry-run plans."

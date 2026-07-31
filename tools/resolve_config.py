@@ -32,6 +32,7 @@ TREE_HASH_ALGORITHM = "sha256-jsonl-posix-path-size-content-sha256-v1"
 DERIVED_FINGERPRINT_SCHEMA = "energy-repro/derived-fingerprint/v1"
 DERIVED_RECEIPT_SCHEMA = "energy-repro/derived-receipt/v1"
 EXECUTION_PROVENANCE_SCHEMA = "energy-repro/execution-provenance/v1"
+PILOT_CLASSIFICATION = "workflow-pilot-not-paper-reproduction"
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 PORTABLE_PROFILE_RE = re.compile(r"(?:^|[-_])portable(?:$|[-_])", re.IGNORECASE)
 SECRET_KEYS = {
@@ -455,6 +456,36 @@ def _validate_recipe(recipe: Mapping[str, Any]) -> None:
         raise ConfigResolutionError(f"unsupported recipe schema: {schema!r}")
     if not recipe.get("name"):
         raise ConfigResolutionError("recipe is missing a non-empty 'name'")
+    for field in ("allowed_profiles", "allowed_stages"):
+        values = recipe.get(field)
+        if values is not None and (
+            not isinstance(values, list)
+            or not values
+            or not all(isinstance(item, str) and item for item in values)
+        ):
+            raise ConfigResolutionError(
+                f"recipe.{field} must be a non-empty list of names"
+            )
+    sft_data_mode = recipe.get("sft_data_mode")
+    if sft_data_mode not in (None, "synthetic", "original"):
+        raise ConfigResolutionError(
+            "recipe.sft_data_mode must be 'synthetic' or 'original'"
+        )
+    if sft_data_mode == "original" and recipe.get("pipeline") != "sft":
+        raise ConfigResolutionError(
+            "recipe.sft_data_mode='original' requires pipeline='sft'"
+        )
+    pilot = recipe.get("pilot")
+    if pilot is not None:
+        if not isinstance(pilot, Mapping):
+            raise ConfigResolutionError("recipe.pilot must be a mapping")
+        if pilot.get("enabled") and (
+            recipe.get("classification") != PILOT_CLASSIFICATION
+            or pilot.get("classification") != PILOT_CLASSIFICATION
+        ):
+            raise ConfigResolutionError(
+                "pilot recipes must use the workflow-pilot-not-paper-reproduction classification"
+            )
 
 
 def _validate_assets_lock(lock: Mapping[str, Any], formal: bool) -> None:
@@ -504,6 +535,21 @@ def _validate_execution_provenance(
     for key in required_sha256:
         if not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get(key) or "")):
             raise ConfigResolutionError(f"execution provenance has no valid {key}")
+    capsule_tools = provenance.get("capsule_tools")
+    if capsule_tools is not None:
+        if not isinstance(capsule_tools, Mapping) or not capsule_tools:
+            raise ConfigResolutionError(
+                "execution provenance capsule_tools must be a non-empty mapping"
+            )
+        for name, digest in capsule_tools.items():
+            if (
+                not isinstance(name, str)
+                or not re.fullmatch(r"[A-Za-z0-9._-]+\.py", name)
+                or not re.fullmatch(r"[0-9a-f]{64}", str(digest))
+            ):
+                raise ConfigResolutionError(
+                    "execution provenance contains an invalid capsule tool digest"
+                )
 
 
 def _asset_ids_for_recipe(
@@ -796,9 +842,14 @@ def _apply_runtime_paths(
         "teacher_logprobs": derived_root / "logprob_cache" / "teacher_logprobs",
         "synthetic_dataset": derived_root / "synthetic_dataset",
     }
+    original_sft = (
+        str(config.get("pipeline", "")).lower() == "sft"
+        and recipe.get("sft_data_mode") == "original"
+    )
     derived: dict[str, dict[str, Any]] = {
         "preprocessed": {
-            "required_for_stage": stage == "teacher",
+            "required_for_stage": stage == "teacher"
+            or (stage == "student" and original_sft),
             "target_for_stage": stage == "preprocess",
         },
         "logprob_cache": {
@@ -816,9 +867,11 @@ def _apply_runtime_paths(
         },
         "synthetic_dataset": {
             "required_for_stage": stage == "student"
-            and str(config.get("pipeline", "")).lower() == "sft",
+            and str(config.get("pipeline", "")).lower() == "sft"
+            and not original_sft,
             "target_for_stage": stage == "teacher"
-            and str(config.get("pipeline", "")).lower() == "sft",
+            and str(config.get("pipeline", "")).lower() == "sft"
+            and not original_sft,
         },
     }
     for artifact, spec in derived.items():
@@ -858,7 +911,11 @@ def _apply_runtime_paths(
     distillation = _ensure_mapping(config, "distillation")
     distillation["logprob_cache_path"] = derived["logprob_cache"]["path"]
     synthetic = _ensure_mapping(config, "synthetic_data")
-    synthetic["synthetic_dataset_path"] = derived["synthetic_dataset"]["path"]
+    synthetic["synthetic_dataset_path"] = (
+        derived["preprocessed"]["path"]
+        if original_sft
+        else derived["synthetic_dataset"]["path"]
+    )
 
     field_map = {
         "teacher": (("model", "teacher"), ("model", "teacher_revision")),
@@ -1103,6 +1160,10 @@ def resolve_config(
     config_hash = _sha256_json(config)
     yaml_hash = hashlib.sha256(yaml_text.encode("utf-8")).hexdigest()
 
+    pilot_enabled = bool(
+        isinstance(recipe.get("pilot"), Mapping)
+        and recipe["pilot"].get("enabled")
+    )
     metadata: dict[str, Any] = {
         "schema": SCHEMA,
         "stage": stage,
@@ -1124,9 +1185,12 @@ def resolve_config(
             "name": str(recipe.get("name") or experiment_file.stem),
             "pipeline": config.get("pipeline"),
             "asset_set": recipe.get("asset_set"),
+            "sft_data_mode": recipe.get("sft_data_mode"),
+            "classification": recipe.get("classification"),
+            "pilot": pilot_enabled,
         },
         "runtime_environment": {
-            "WANDB_MODE": "offline",
+            "WANDB_MODE": "disabled" if pilot_enabled else "offline",
         },
         "assets": asset_records,
         "derived_artifacts": {

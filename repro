@@ -30,6 +30,7 @@ BUNDLE = Path(__file__).resolve().parent
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 SECRET_NAME = re.compile(r"(TOKEN|KEY|PASSWORD|SECRET|CREDENTIAL)", re.I)
+PILOT_CLASSIFICATION = "workflow-pilot-not-paper-reproduction"
 EXIT_ARGS = 2
 EXIT_PREREQ = 3
 EXIT_POLICY = 4
@@ -796,12 +797,18 @@ def command_bootstrap(args: argparse.Namespace) -> dict[str, Any]:
     return {"status": "PASS", **plan, "source_verification": source_info, "image": image_info}
 
 
-def common_container_env(run_id: str | None = None) -> list[str]:
+def common_container_env(
+    run_id: str | None = None,
+    *,
+    wandb_mode: str = "offline",
+) -> list[str]:
+    if wandb_mode not in {"offline", "disabled"}:
+        raise ReproError(f"Unsupported W&B mode: {wandb_mode!r}", EXIT_POLICY)
     values = {
         "CUDA_VISIBLE_DEVICES": "0",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
-        "WANDB_MODE": "offline",
+        "WANDB_MODE": wandb_mode,
         "TZ": "UTC",
         "OMP_NUM_THREADS": "16",
         "MKL_NUM_THREADS": "16",
@@ -890,12 +897,21 @@ def deterministic_plan(
     image: str,
 ) -> tuple[dict[str, Any], str]:
     upstream = read_json(BUNDLE / "upstream.lock.json")
+    pilot = recipe.get("pilot", {}) if recipe else {}
+    if not isinstance(pilot, dict):
+        raise ReproError("Recipe pilot metadata must be a JSON object", EXIT_POLICY)
     scientific = {
         "schema": "energy-repro/plan/v1",
         "profile": profile["name"],
         "compliance_label": profile["compliance_label"],
         "recipe": recipe["name"] if recipe else "telemetry",
         "pipeline": recipe["pipeline"] if recipe else "prerun",
+        "result_classification": (
+            recipe.get("classification", profile["compliance_label"])
+            if recipe
+            else profile["compliance_label"]
+        ),
+        "pilot": bool(pilot.get("enabled")),
         "stage": stage,
         "seed": seed,
         "attempt": attempt,
@@ -929,6 +945,10 @@ def execution_provenance(image_verification: dict[str, Any]) -> dict[str, Any]:
         "asset_lock_sha256": sha256_file(BUNDLE / "assets.lock.json"),
         "build_context_sha256": labels.get("io.energy-repro.build-context-sha256"),
         "resolver_tool_sha256": sha256_file(BUNDLE / "tools" / "resolve_config.py"),
+        "capsule_tools": {
+            path.name: sha256_file(path)
+            for path in sorted((BUNDLE / "tools").glob("*.py"))
+        },
     }
 
 
@@ -1185,7 +1205,9 @@ def initial_manifest(
                 "CUDA_VISIBLE_DEVICES": "0",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
-                "WANDB_MODE": "offline",
+                "WANDB_MODE": (
+                    "disabled" if plan.get("pilot") else "offline"
+                ),
                 "TZ": "UTC",
             },
         },
@@ -1415,9 +1437,25 @@ def command_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
 def stage_module(recipe: dict[str, Any], stage: str) -> list[str]:
     if stage == "preprocess":
+        tool = recipe.get("preprocess_tool")
+        if tool is not None:
+            if tool != "pilot_preprocess.py":
+                raise ReproError(
+                    f"Unsupported capsule preprocessing tool: {tool!r}",
+                    EXIT_POLICY,
+                )
+            return ["python", f"/opt/energy-repro/tools/{tool}"]
         module = f"distill_bench.data.{recipe['preprocess_script']}"
         return ["python", "-m", module]
     if stage == "teacher":
+        tool = recipe.get("teacher_tool")
+        if tool is not None:
+            if tool != "pilot_teacher.py":
+                raise ReproError(
+                    f"Unsupported capsule teacher tool: {tool!r}",
+                    EXIT_POLICY,
+                )
+            return ["python", f"/opt/energy-repro/tools/{tool}"]
         module = f"distill_bench.data.{recipe['teacher_script']}"
         return ["python", "-m", module]
     if stage == "student":
@@ -1486,9 +1524,15 @@ def stage_argv(
     recipe: dict[str, Any],
 ) -> list[str]:
     config = f"/runs/{run_id}/resolved/{args.stage}.yaml"
+    pilot = recipe.get("pilot")
+    wandb_mode = (
+        "disabled"
+        if isinstance(pilot, dict) and pilot.get("enabled")
+        else "offline"
+    )
     return [
         *base_gpu_container(args, ref),
-        *common_container_env(run_id),
+        *common_container_env(run_id, wandb_mode=wandb_mode),
         *runtime_cache_args(cache),
         *docker_mount(cache / "assets", "/cache/assets", True),
         *docker_mount(cache / "derived", "/cache/derived", False),
@@ -1508,6 +1552,51 @@ def command_run(args: argparse.Namespace) -> dict[str, Any]:
     if args.stage not in profile.get("runnable_stages", []):
         raise ReproError(f"{args.profile} does not allow stage {args.stage!r}", EXIT_POLICY)
     recipe = read_json(recipe_path(args.recipe))
+    allowed_profiles = recipe.get("allowed_profiles")
+    if allowed_profiles is not None:
+        if not isinstance(allowed_profiles, list) or not all(
+            isinstance(item, str) for item in allowed_profiles
+        ):
+            raise ReproError(
+                f"Recipe {args.recipe!r} has an invalid allowed_profiles policy",
+                EXIT_POLICY,
+            )
+        if args.profile not in allowed_profiles:
+            raise ReproError(
+                f"Recipe {args.recipe!r} is allowed only with profiles: "
+                + ", ".join(sorted(allowed_profiles)),
+                EXIT_POLICY,
+            )
+    allowed_stages = recipe.get("allowed_stages")
+    if allowed_stages is not None:
+        if not isinstance(allowed_stages, list) or not all(
+            isinstance(item, str) for item in allowed_stages
+        ):
+            raise ReproError(
+                f"Recipe {args.recipe!r} has an invalid allowed_stages policy",
+                EXIT_POLICY,
+            )
+        if args.stage not in allowed_stages:
+            raise ReproError(
+                f"Recipe {args.recipe!r} allows only stages: "
+                + ", ".join(sorted(allowed_stages)),
+                EXIT_POLICY,
+            )
+    pilot = recipe.get("pilot", {})
+    if not isinstance(pilot, dict):
+        raise ReproError(
+            f"Recipe {args.recipe!r} has invalid pilot metadata",
+            EXIT_POLICY,
+        )
+    if pilot.get("enabled"):
+        if (
+            recipe.get("classification") != PILOT_CLASSIFICATION
+            or pilot.get("classification") != PILOT_CLASSIFICATION
+        ):
+            raise ReproError(
+                f"Pilot recipe {args.recipe!r} is missing the required non-paper classification",
+                EXIT_POLICY,
+            )
     cache, runs, state_dir = resolved_dirs(args)
     ref, immutable = image_ref(args, state_dir, planning=args.dry_run)
     plan, run_id = deterministic_plan(profile, recipe, args.stage, args.seed, args.attempt, ref)
@@ -1527,6 +1616,8 @@ def command_run(args: argparse.Namespace) -> dict[str, Any]:
         "resolver_argv": resolve_command,
         "execution_argv": execute_command,
         "known_deviations_acknowledged": bool(args.ack_known_deviations),
+        "result_classification": plan["result_classification"],
+        "pilot": plan["pilot"],
     }
     if args.dry_run:
         deferred = ["image", "GPU", "assets", "derived stage inputs"]
@@ -1992,6 +2083,62 @@ def command_manifest(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def command_export_results(args: argparse.Namespace) -> dict[str, Any]:
+    if not SAFE_NAME.fullmatch(args.run_id):
+        raise ReproError(f"Invalid run ID: {args.run_id!r}", EXIT_ARGS)
+    _, runs, _ = resolved_dirs(args)
+    run_root = runs / args.run_id
+    output = safe_path(args.output, "public result directory")
+    archive = (
+        safe_path(args.archive, "public result archive")
+        if args.archive is not None
+        else None
+    )
+    command = [
+        sys.executable,
+        str(BUNDLE / "tools" / "export_results.py"),
+        str(run_root),
+        "--output",
+        str(output),
+        "--max-file-bytes",
+        str(args.max_file_bytes),
+    ]
+    if archive is not None:
+        command.extend(["--archive", str(archive)])
+    plan = {
+        "command": "export-results",
+        "run_id": args.run_id,
+        "run_root": str(run_root),
+        "output": str(output),
+        "archive": str(archive) if archive is not None else None,
+        "max_file_bytes": args.max_file_bytes,
+        "source_verification": "full-manifest-inventory-and-sha256",
+        "public_policy": (
+            "sanitized metadata, compact metrics/energy/log summaries; "
+            "no models, checkpoints, datasets, assets, W&B files, secrets, "
+            "host identity, GPU UUIDs, or absolute paths"
+        ),
+        "argv": command,
+    }
+    if args.dry_run:
+        return {"status": "PLANNED", "dry_run": True, **plan}
+    if not run_root.is_dir():
+        raise ReproError(f"Run does not exist: {run_root}", EXIT_PREREQ)
+    result = run_capture(command, check=False)
+    detail_text = (result.stdout or result.stderr).strip()
+    try:
+        detail: Any = json.loads(detail_text)
+    except json.JSONDecodeError:
+        detail = detail_text
+    if result.returncode:
+        raise ReproError(
+            "Public result export failed",
+            EXIT_POLICY,
+            {"plan": plan, "detail": detail},
+        )
+    return {"status": "PASS", **plan, "result": detail}
+
+
 def common_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
@@ -2074,6 +2221,22 @@ def build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--verify", action="store_true")
     manifest.add_argument("--deep", action="store_true")
     manifest.set_defaults(handler=command_manifest)
+
+    export = subparsers.add_parser(
+        "export-results",
+        parents=[common],
+        help="Create a sanitized compact public result bundle",
+    )
+    export.add_argument("run_id")
+    export.add_argument("--output", required=True)
+    export.add_argument("--archive")
+    export.add_argument(
+        "--max-file-bytes",
+        type=int,
+        default=1024 * 1024,
+        help="Maximum source file size eligible for public content (default: 1 MiB)",
+    )
+    export.set_defaults(handler=command_export_results)
     return parser
 
 
@@ -2083,6 +2246,8 @@ def validate_numbers(args: argparse.Namespace) -> None:
             raise ReproError(f"--{name} must be at least 1", EXIT_ARGS)
     if hasattr(args, "seed") and args.seed < 0:
         raise ReproError("--seed must be non-negative", EXIT_ARGS)
+    if hasattr(args, "max_file_bytes") and args.max_file_bytes < 1:
+        raise ReproError("--max-file-bytes must be positive", EXIT_ARGS)
 
 
 def main(argv: list[str] | None = None) -> int:
